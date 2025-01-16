@@ -3,6 +3,8 @@
  * Copyright (C) 2012 Regents of the University of California
  */
 
+#include <asm-generic/signal.h>
+#include <linux/compiler_attributes.h>
 #include <linux/cpu.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -114,6 +116,8 @@ void die(struct pt_regs *regs, const char *str)
 static __always_inline
 bool mark_trap_entry(int signo, struct pt_regs *regs)
 {
+	oob_trap_notify(signo, regs);
+	
 	/*
 	 * Dovetail: irqentry_enter*() already synchronized the
 	 * virtual and real interrupt states for us. If running
@@ -125,21 +129,45 @@ bool mark_trap_entry(int signo, struct pt_regs *regs)
 		return true;
 	}
 
+	/*
+	 * If the oob core did not switch us inband, our caller is
+	 * expected to leave the trap handler immediately, so we may
+	 * notify the core about this right now.
+	 */
+	oob_trap_unwind(signo, regs);
+
 	return false;
 }
 
 static __always_inline
 void mark_trap_exit(int signo, struct pt_regs *regs)
 {
+	oob_trap_unwind(signo, regs);
 	hard_cond_local_irq_disable();
+}
+
+static __always_inline
+bool mark_trap_entry_raw(int trapnr, struct pt_regs *regs)
+{
+	oob_trap_notify(trapnr, regs);
+
+	if (running_oob()) {
+		oob_trap_unwind(trapnr, regs);
+		return false;
+	}
+
+	return true;
+}
+
+static __always_inline
+void mark_trap_exit_raw(int trapnr, struct pt_regs *regs)
+{
+	oob_trap_unwind(trapnr, regs);
 }
 
 void do_trap(struct pt_regs *regs, int signo, int code, unsigned long addr)
 {
 	struct task_struct *tsk = current;
-
-	if (!mark_trap_entry(signo, regs))
-		return;
 
 	if (show_unhandled_signals && unhandled_signal(tsk, signo)
 	    && printk_ratelimit()) {
@@ -152,8 +180,6 @@ void do_trap(struct pt_regs *regs, int signo, int code, unsigned long addr)
 	}
 
 	force_sig_fault(signo, code, (void __user *)addr);
-
-	mark_trap_exit(signo, regs);
 }
 
 static void do_trap_error(struct pt_regs *regs, int signo, int code,
@@ -180,9 +206,12 @@ static void do_trap_error(struct pt_regs *regs, int signo, int code,
 #else
 #define __trap_section noinstr
 #endif
-#define DO_ERROR_INFO(name, signo, code, str)					\
+#define DO_ERROR_INFO(name, signo, code, str, trapnr)					\
 asmlinkage __visible __trap_section void name(struct pt_regs *regs)		\
 {										\
+	if(!mark_trap_entry_raw(signo, regs))						\
+		return;								\
+										\
 	if (user_mode(regs)) {							\
 		irqentry_enter_from_user_mode(regs);				\
 		do_trap_error(regs, signo, code, regs->epc, "Oops - " str);	\
@@ -192,18 +221,23 @@ asmlinkage __visible __trap_section void name(struct pt_regs *regs)		\
 		do_trap_error(regs, signo, code, regs->epc, "Oops - " str);	\
 		irqentry_nmi_exit(regs, state);					\
 	}									\
+										\
+	mark_trap_exit_raw(signo, regs);	\
 }
 
 DO_ERROR_INFO(do_trap_unknown,
-	SIGILL, ILL_ILLTRP, "unknown exception");
+	SIGILL, ILL_ILLTRP, "unknown exception", RISCV_TRAP_UNKNOWN);
 DO_ERROR_INFO(do_trap_insn_misaligned,
-	SIGBUS, BUS_ADRALN, "instruction address misaligned");
+	SIGBUS, BUS_ADRALN, "instruction address misaligned", RISCV_TRAP_INSN_MISALIGNED);
 DO_ERROR_INFO(do_trap_insn_fault,
-	SIGSEGV, SEGV_ACCERR, "instruction access fault");
+	SIGSEGV, SEGV_ACCERR, "instruction access fault", RISCV_TRAP_INSN_FAULT);
 
 asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *regs)
 {
 	bool handled;
+
+	if(!mark_trap_entry_raw(RISCV_TRAP_INSN_ILLEGAL, regs))
+		return;
 
 	if (user_mode(regs)) {
 		irqentry_enter_from_user_mode(regs);
@@ -233,13 +267,17 @@ asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *re
 
 		irqentry_nmi_exit(regs, state);
 	}
+
 }
 
 DO_ERROR_INFO(do_trap_load_fault,
-	SIGSEGV, SEGV_ACCERR, "load access fault");
+	SIGSEGV, SEGV_ACCERR, "load access fault", RISCV_TRAP_LOAD_FAULT);
 
 asmlinkage __visible __trap_section void do_trap_load_misaligned(struct pt_regs *regs)
 {
+	if(!mark_trap_entry_raw(RISCV_TRAP_LOAD_MISALIGNED, regs))
+		return;
+
 	if (user_mode(regs)) {
 		irqentry_enter_from_user_mode(regs);
 
@@ -257,10 +295,15 @@ asmlinkage __visible __trap_section void do_trap_load_misaligned(struct pt_regs 
 
 		irqentry_nmi_exit(regs, state);
 	}
+
+	mark_trap_exit_raw(RISCV_TRAP_LOAD_MISALIGNED, regs);
 }
 
 asmlinkage __visible __trap_section void do_trap_store_misaligned(struct pt_regs *regs)
 {
+	if(!mark_trap_entry_raw(RISCV_TRAP_STORE_MISALIGNED, regs))
+		return;
+
 	if (user_mode(regs)) {
 		irqentry_enter_from_user_mode(regs);
 
@@ -278,13 +321,15 @@ asmlinkage __visible __trap_section void do_trap_store_misaligned(struct pt_regs
 
 		irqentry_nmi_exit(regs, state);
 	}
+
+	mark_trap_exit_raw(RISCV_TRAP_STORE_MISALIGNED, regs);
 }
 DO_ERROR_INFO(do_trap_store_fault,
-	SIGSEGV, SEGV_ACCERR, "store (or AMO) access fault");
+	SIGSEGV, SEGV_ACCERR, "store (or AMO) access fault", RISCV_TRAP_STORE_FAULT);
 DO_ERROR_INFO(do_trap_ecall_s,
-	SIGILL, ILL_ILLTRP, "environment call from S-mode");
+	SIGILL, ILL_ILLTRP, "environment call from S-mode", RISCV_TRAP_ECALL_S);
 DO_ERROR_INFO(do_trap_ecall_m,
-	SIGILL, ILL_ILLTRP, "environment call from M-mode");
+	SIGILL, ILL_ILLTRP, "environment call from M-mode", RISCV_TRAP_ECALL_M);
 
 static inline unsigned long get_break_insn_length(unsigned long pc)
 {
@@ -336,6 +381,9 @@ void handle_break(struct pt_regs *regs)
 
 asmlinkage __visible __trap_section void do_trap_break(struct pt_regs *regs)
 {
+	if(!mark_trap_entry_raw(RISCV_TRAP_BREAK, regs))
+		return;
+
 	if (user_mode(regs)) {
 		irqentry_enter_from_user_mode(regs);
 
@@ -349,6 +397,8 @@ asmlinkage __visible __trap_section void do_trap_break(struct pt_regs *regs)
 
 		irqentry_nmi_exit(regs, state);
 	}
+
+	mark_trap_exit_raw(RISCV_TRAP_BREAK, regs);
 }
 
 asmlinkage __visible __trap_section  __no_stack_protector
@@ -364,6 +414,15 @@ void do_trap_ecall_u(struct pt_regs *regs)
 		riscv_v_vstate_discard(regs);
 
 		syscall = syscall_enter_from_user_mode(regs, syscall);
+
+		if(dovetailing()) {
+			if (syscall == EXIT_SYSCALL_OOB) {
+				hard_local_irq_disable();
+				return;
+			}
+			if (syscall == EXIT_SYSCALL_TAIL)
+				goto done_inband;
+		}
 
 		add_random_kstack_offset();
 
@@ -382,6 +441,7 @@ void do_trap_ecall_u(struct pt_regs *regs)
 		 */
 		choose_random_kstack_offset(get_random_u16());
 
+done_inband:
 		syscall_exit_to_user_mode(regs);
 	} else {
 		irqentry_state_t state = irqentry_nmi_enter(regs);
@@ -397,16 +457,21 @@ void do_trap_ecall_u(struct pt_regs *regs)
 #ifdef CONFIG_MMU
 asmlinkage __visible noinstr void do_page_fault(struct pt_regs *regs)
 {
+	if(!mark_trap_entry_raw(RISCV_TRAP_PAGE_FAULT, regs))
+		return;
+	
 	irqentry_state_t state = irqentry_enter(regs);
-
+	
 	handle_page_fault(regs);
 
 	if (running_inband())
 		local_irq_disable_full();
 	else
 		hard_local_irq_disable();
-
+	
 	irqentry_exit(regs, state);
+
+	mark_trap_exit_raw(RISCV_TRAP_PAGE_FAULT, regs);
 }
 #endif
 

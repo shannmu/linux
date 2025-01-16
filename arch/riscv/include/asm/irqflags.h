@@ -55,9 +55,9 @@ static inline void native_irq_restore(unsigned long flags)
 
 static inline void native_irq_sync(void)
 {
-	native_irq_disable();
-	asm volatile("nop" : : : "memory");
 	native_irq_enable();
+	asm volatile("nop" : : : "memory");
+	native_irq_disable();
 }
 
 #endif /* _ASM_RISCV_IRQFLAGS_H */

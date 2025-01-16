@@ -25,6 +25,8 @@ config RISCV
 	select ARCH_ENABLE_THP_MIGRATION if TRANSPARENT_HUGEPAGE
 	select ARCH_HAS_BINFMT_FLAT
 	select ARCH_HAS_CURRENT_STACK_POINTER
+	select HAVE_DOVETAIL
+	select HAVE_ARCH_EVL
 	select ARCH_HAS_DEBUG_VIRTUAL if MMU
 	select ARCH_HAS_DEBUG_VM_PGTABLE
 	select ARCH_HAS_DEBUG_WX
@@ -307,6 +309,9 @@ config ARCH_SPARSEMEM_ENABLE
 
 config ARCH_SELECT_MEMORY_MODEL
 	def_bool ARCH_SPARSEMEM_ENABLE
+
+source "kernel/Kconfig.dovetail"
+source "kernel/Kconfig.evl"
 
 config ARCH_SUPPORTS_UPROBES
 	def_bool y

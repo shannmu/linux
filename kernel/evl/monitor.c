@@ -1173,6 +1173,7 @@ static struct evl_element *
 monitor_factory_build(struct evl_factory *fac, const char __user *u_name,
 		void __user *u_attrs, int clone_flags, u32 *state_offp)
 {
+	pr_info("EVL: monitor factory build\n");
 	struct evl_monitor_state *state;
 	struct evl_monitor_attrs attrs;
 	struct evl_monitor *mon;

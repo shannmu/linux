@@ -733,6 +733,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 	int ret;
 	struct kvm_cpu_trap trap;
 	struct kvm_run *run = vcpu->run;
+	unsigned long flags;
 
 	if (!vcpu->arch.ran_atleast_once)
 		kvm_riscv_vcpu_setup_config(vcpu);
@@ -786,7 +787,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 
 		kvm_riscv_check_vcpu_requests(vcpu);
 
-		preempt_disable();
+		flags = hard_preempt_disable();
 
 		/* Update AIA HW state before entering guest */
 		ret = kvm_riscv_vcpu_aia_update(vcpu);
@@ -795,7 +796,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 			continue;
 		}
 
-		local_irq_disable();
+		hard_local_irq_disable();
 
 		/*
 		 * Ensure we set mode to IN_GUEST_MODE after we disable
@@ -868,16 +869,16 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 		 * recognised, so we just hope that the CPU takes any pending
 		 * interrupts between the enable and disable.
 		 */
-		local_irq_enable();
-		local_irq_disable();
+		hard_local_irq_enable();
+		hard_local_irq_disable();
 
 		guest_timing_exit_irqoff();
 
-		local_irq_enable();
+		hard_local_irq_enable();
 
 		trace_kvm_exit(&trap);
 
-		preempt_enable();
+		hard_preempt_enable(flags);
 
 		kvm_vcpu_srcu_read_lock(vcpu);
 

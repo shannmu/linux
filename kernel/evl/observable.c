@@ -1137,6 +1137,7 @@ static struct evl_element *
 observable_factory_build(struct evl_factory *fac, const char __user *u_name,
 		void __user *u_attrs, int clone_flags, u32 *state_offp)
 {
+	pr_info("EVL: observable factory build\n");
 	struct evl_observable *observable;
 
 	if (clone_flags & ~EVL_OBSERVABLE_CLONE_FLAGS)

@@ -9,6 +9,7 @@
 #ifndef __RISCV_KVM_HOST_H__
 #define __RISCV_KVM_HOST_H__
 
+#include "linux/spinlock_types.h"
 #include <linux/types.h>
 #include <linux/kvm.h>
 #include <linux/kvm_types.h>
@@ -246,7 +247,12 @@ struct kvm_vcpu_arch {
 	struct kvm_vcpu_timer timer;
 
 	/* HFENCE request queue */
+#ifdef CONFIG_IRQ_PIPELINE
 	spinlock_t hfence_lock;
+#else
+	hard_spinlock_t hfence_lock;
+#endif
+
 	unsigned long hfence_head;
 	unsigned long hfence_tail;
 	struct kvm_riscv_hfence hfence_queue[KVM_RISCV_VCPU_MAX_HFENCE];

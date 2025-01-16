@@ -39,6 +39,7 @@
 
 #ifndef __ASSEMBLY__
 
+#include <dovetail/thread_info.h>
 #include <asm/processor.h>
 #include <asm/csr.h>
 
@@ -54,6 +55,7 @@ struct thread_info {
 	unsigned long		flags;		/* low level flags */
 #ifdef CONFIG_IRQ_PIPELINE
 	__u32			local_flags;	/* local (synchronous) flags */
+	struct oob_thread_state	oob_state;
 #define ti_local_flags(__ti)    ((__ti)->local_flags)
 #endif  
 	int                     preempt_count;  /* 0=>preemptible, <0=>BUG */
@@ -116,21 +118,28 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src);
 #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
 #define TIF_RESTORE_SIGMASK	4	/* restore signal mask in do_signal() */
 #define TIF_MEMDIE		5	/* is terminating due to OOM killer */
+#define TIF_RETUSER		6	/* INBAND_TASK_RETUSER is pending */
 #define TIF_NOTIFY_SIGNAL	9	/* signal notifications exist */
 #define TIF_UPROBE		10	/* uprobe breakpoint or singlestep */
 #define TIF_32BIT		11	/* compat-mode 32bit process */
 #define TIF_RISCV_V_DEFER_RESTORE	12 /* restore Vector before returing to user */
+#define TIF_MAYDAY		13	/* emergency signals pending */
 
 #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
 #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
 #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+#define _TIF_RETUSER		(1 << TIF_RETUSER)
 #define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
 #define _TIF_UPROBE		(1 << TIF_UPROBE)
 #define _TIF_RISCV_V_DEFER_RESTORE	(1 << TIF_RISCV_V_DEFER_RESTORE)
+#define _TIF_MAYDAY		(1 << TIF_MAYDAY)
 
 /*
  * Local (synchronous) thread flags.
  */
 #define _TLF_OOB		0x0001
+#define _TLF_DOVETAIL		0x0002
+#define _TLF_OFFSTAGE		0x0004
+#define _TLF_OOBTRAP		0x0008
 
 #endif /* _ASM_RISCV_THREAD_INFO_H */

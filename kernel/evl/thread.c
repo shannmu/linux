@@ -6,6 +6,7 @@
  * Copyright (C) 2001, 2018 Philippe Gerum  <rpm@xenomai.org>
  */
 
+#include "linux/smp.h"
 #include <linux/stdarg.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
@@ -259,7 +260,7 @@ int evl_init_thread(struct evl_thread *thread,
 #endif
 
 	trace_evl_init_thread(thread, iattr, ret);
-
+	pr_info("EVL: thread %s created\n", thread->name);
 	return 0;
 
 err_out:
@@ -628,8 +629,10 @@ void evl_wakeup_thread(struct evl_thread *thread, int mask, int info)
 	struct evl_rq *rq;
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: evl_wakeup_thread: %s get_thread_rq on %d\n", thread->name);
 	evl_wakeup_thread_locked(thread, mask, info);
 	evl_put_thread_rq(thread, rq, flags);
+	pr_info("EVL: evl_wakeup_thread: %s put_thread_rq on %d\n", thread->name);
 }
 
 void evl_hold_thread(struct evl_thread *thread, int mask)
@@ -643,6 +646,7 @@ void evl_hold_thread(struct evl_thread *thread, int mask)
 	trace_evl_hold_thread(thread, mask);
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: evl_hold_thread: %s get_thread_rq\n", thread->name);
 
 	oldstate = thread->state;
 
@@ -682,6 +686,7 @@ void evl_hold_thread(struct evl_thread *thread, int mask)
 		dovetail_request_ucall(thread->altsched.task);
  out:
 	evl_put_thread_rq(thread, rq, flags);
+	pr_info("EVL: evl_hold_thread: %s put_thread_rq\n", thread->name);
 }
 
 /* thread->lock + thread->rq->lock held, irqs off */
@@ -730,8 +735,10 @@ void evl_release_thread(struct evl_thread *thread, int mask, int info)
 	struct evl_rq *rq;
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: evl_release_thread: %s get_thread_rq\n", thread->name);
 	evl_release_thread_locked(thread, mask, info);
 	evl_put_thread_rq(thread, rq, flags);
+	pr_info("EVL: evl_release_thread: %s put_thread_rq\n", thread->name);
 }
 
 static void inband_task_wakeup(struct irq_work *work)
@@ -915,6 +922,7 @@ void evl_cancel_thread(struct evl_thread *thread)
 		return;
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: evl_cancel_thread: %s get_thread_rq\n", thread->name);
 
 	if (thread->state & EVL_T_ZOMBIE) {
 		evl_put_thread_rq(thread, rq, flags);
@@ -940,11 +948,13 @@ void evl_cancel_thread(struct evl_thread *thread)
 	if ((thread->state & (EVL_T_DORMANT|EVL_T_INBAND)) == (EVL_T_DORMANT|EVL_T_INBAND)) {
 		evl_release_thread_locked(thread, EVL_T_DORMANT, EVL_T_KICKED);
 		evl_put_thread_rq(thread, rq, flags);
+		pr_info("EVL: evl_cancel_thread: %s put_thread_rq\n", thread->name);
 		goto out;
 	}
 
 check_self_cancel:
 	evl_put_thread_rq(thread, rq, flags);
+	pr_info("EVL: evl_cancel_thread: %s put_thread_rq\n", thread->name);
 
 	if (evl_current() == thread) {
 		evl_test_cancel();
@@ -999,6 +1009,7 @@ int evl_join_thread(struct evl_thread *thread, bool uninterruptible)
 		return -EDEADLK;
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: evl_join_thread: %s get_thread_rq\n", thread->name);
 
 	/*
 	 * We allow multiple callers to join @thread, this is purely a
@@ -1013,10 +1024,12 @@ int evl_join_thread(struct evl_thread *thread, bool uninterruptible)
 
 	if (curr && !(curr->state & EVL_T_INBAND)) {
 		evl_put_thread_rq(thread, rq, flags);
+		pr_info("EVL: evl_join_thread: %s put_thread_rq\n", thread->name);
 		evl_switch_inband(EVL_HMDIAG_NONE);
 		switched = true;
 	} else {
 		evl_put_thread_rq(thread, rq, flags);
+		pr_info("EVL: evl_join_thread: %s put_thread_rq\n", thread->name);
 	}
 
 	/*
@@ -1049,8 +1062,10 @@ int evl_set_thread_schedparam(struct evl_thread *thread,
 	int ret;
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: evl_set_thread_schedparam: %s get_thread_rq\n", thread->name);
 	ret = evl_set_thread_schedparam_locked(thread, sched_class, sched_param);
 	evl_put_thread_rq_check(thread, rq, flags);
+	pr_info("EVL: evl_set_thread_schedparam: %s put_thread_rq\n", thread->name);
 
 	return ret;
 }
@@ -1187,6 +1202,7 @@ void evl_kick_thread(struct evl_thread *thread, int info)
 	struct evl_rq *rq;
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: evl_kick_thread: %s get_thread_rq\n", thread->name);
 
 	if (thread->state & EVL_T_INBAND)
 		goto out;
@@ -1287,6 +1303,7 @@ void evl_kick_thread(struct evl_thread *thread, int info)
 		thread->info |= info;
 out:
 	evl_put_thread_rq(thread, rq, flags);
+	pr_info("EVL: evl_kick_thread: %s put_thread_rq\n", thread->name);
 }
 EXPORT_SYMBOL_GPL(evl_kick_thread);
 
@@ -1298,6 +1315,7 @@ void evl_demote_thread(struct evl_thread *thread)
 	struct evl_rq *rq;
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: evl_demote_thread: %s get_thread_rq\n", thread->name);
 
 	/*
 	 * First demote @thread to the weak class, which still has
@@ -1311,6 +1329,7 @@ void evl_demote_thread(struct evl_thread *thread)
 	evl_set_thread_schedparam_locked(thread, sched_class, &param);
 
 	evl_put_thread_rq_check(thread, rq, flags);
+	pr_info("EVL: evl_demote_thread: %s put_thread_rq\n", thread->name);
 
 	/* Then unblock it from any wait state. */
 	evl_kick_thread(thread, 0);
@@ -2030,6 +2049,7 @@ static int set_sched_attrs(struct evl_thread *thread,
 	trace_evl_thread_setsched(thread, attrs);
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: set_sched_attrs: %s get_thread_rq\n", thread->name);
 
 	tslice = thread->rrperiod;
 	sched_class = evl_find_sched_class(&param, attrs, &tslice);
@@ -2047,6 +2067,7 @@ static int set_sched_attrs(struct evl_thread *thread,
 	ret = evl_set_thread_schedparam_locked(thread, sched_class, &param);
 
 	evl_put_thread_rq_check(thread, rq, flags);
+	pr_info("EVL: set_sched_attrs: %s put_thread_rq\n", thread->name);
 
 	return ret;
 }
@@ -2097,10 +2118,12 @@ static void get_sched_attrs(struct evl_thread *thread,
 	struct evl_rq *rq;
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: get_sched_attrs: %s get_thread_rq\n", thread->name);
 	/* Get the base scheduling attributes. */
 	attrs->sched_priority = thread->bprio;
 	__get_sched_attrs(thread->base_class, thread, attrs);
 	evl_put_thread_rq(thread, rq, flags);
+	pr_info("EVL: get_sched_attrs: %s put_thread_rq\n", thread->name);
 }
 
 void evl_get_thread_state(struct evl_thread *thread,
@@ -2110,6 +2133,7 @@ void evl_get_thread_state(struct evl_thread *thread,
 	struct evl_rq *rq;
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: evl_get_thread_state: %s get_thread_rq\n", thread->name);
 	/* Get the effective scheduling attributes. */
 	statebuf->eattrs.sched_priority = thread->cprio;
 	__get_sched_attrs(thread->sched_class, thread, &statebuf->eattrs);
@@ -2122,6 +2146,7 @@ void evl_get_thread_state(struct evl_thread *thread,
 	statebuf->xtime = ktime_to_ns(evl_get_account_total(
 					&thread->stat.account));
 	evl_put_thread_rq(thread, rq, flags);
+	pr_info("EVL: evl_get_thread_state: %s put_thread_rq\n", thread->name);
 }
 EXPORT_SYMBOL_GPL(evl_get_thread_state);
 
@@ -2146,6 +2171,7 @@ static int update_mode(struct evl_thread *thread, __u32 mask,
 	}
 
 	rq = evl_get_thread_rq(thread, flags);
+	pr_info("EVL: update_mode: %s get_thread_rq\n", thread->name);
 
 	*oldmask = thread->state & EVL_THREAD_MODE_BITS;
 
@@ -2162,6 +2188,7 @@ static int update_mode(struct evl_thread *thread, __u32 mask,
 	}
 
 	evl_put_thread_rq(thread, rq, flags);
+	pr_info("EVL: update_mode: %s put_thread_rq\n", thread->name);
 
 	return 0;
 }
@@ -2468,6 +2495,7 @@ static struct evl_element *
 thread_factory_build(struct evl_factory *fac, const char __user *u_name,
 		void __user *u_attrs, int clone_flags, u32 *state_offp)
 {
+	pr_info("EVL: thread factory build\n");
 	struct evl_observable *observable = NULL;
 	struct task_struct *tsk = current;
 	struct evl_init_thread_attr iattr;

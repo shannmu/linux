@@ -83,11 +83,12 @@ static void __flush_tlb_range(const struct cpumask *cmask, unsigned long asid,
 			      unsigned long stride)
 {
 	unsigned int cpu;
+	unsigned long flags;
 
 	if (cpumask_empty(cmask))
 		return;
 
-	cpu = get_cpu();
+	cpu = hard_get_cpu(flags);
 
 	/* Check if the TLB flush needs to be sent to other CPUs. */
 	if (cpumask_any_but(cmask, cpu) >= nr_cpu_ids) {
@@ -104,7 +105,7 @@ static void __flush_tlb_range(const struct cpumask *cmask, unsigned long asid,
 		on_each_cpu_mask(cmask, __ipi_flush_tlb_range_asid, &ftd, 1);
 	}
 
-	put_cpu();
+	hard_put_cpu(flags);
 }
 
 static inline unsigned long get_mm_asid(struct mm_struct *mm)
