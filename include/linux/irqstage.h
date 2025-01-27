@@ -191,7 +191,7 @@ static __always_inline struct irq_stage_data *this_oob_staged(void)
 
 static __always_inline struct irq_stage_data *__current_irq_staged(void)
 {
-	return &raw_cpu_ptr(&irq_pipeline.stages[0])[stage_level()];
+	return &raw_cpu_ptr(irq_pipeline.stages)[stage_level()];
 }
 
 /**
