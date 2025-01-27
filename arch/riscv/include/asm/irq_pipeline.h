@@ -87,7 +87,11 @@ static inline void arch_local_irq_restore(unsigned long flags)
 static inline
 void arch_save_timer_regs(struct pt_regs *dst, struct pt_regs *src)
 {
+	dst->epc = src->epc;
+	dst->ra = src->ra;
+	dst->sp = src->sp;
 	dst->status = src->status;
+	dst->cause = src->cause;
 }
 
 #else /* !CONFIG_IRQ_PIPELINE */
