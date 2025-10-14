@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Lazy DMA configuration
+#
+
+config LAZYDMA
+	tristate "Lazy DMA tracking and VM-exit support"
+	depends on X86_64 && PCI
+	help
+	  This driver provides DMA tracking and VM-exit based page management
+	  for virtualized environments. It tracks DMA mappings at PMD (2MB page)
+	  granularity and triggers VM-exits to coordinate with the hypervisor.
+
+	  The driver hooks into the kernel's DMA operations to monitor when
+	  physical memory is mapped for DMA access. When a new PMD is mapped,
+	  it triggers a VM-exit to notify the host, which can then take
+	  appropriate actions (e.g., pinning pages, updating EPT mappings).
+
+	  To use this driver, you need to specify reserved memory regions via
+	  kernel command line parameters:
+	    lazydma_track=addr,size  - Tracking memory region
+	    lazydma_mmio=addr,size   - MMIO region for VM-exit triggers
+
+	  Say Y or M if you are running in a VM and want to use lazy DMA
+	  tracking features. If unsure, say N.
