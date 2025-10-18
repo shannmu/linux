@@ -1573,4 +1573,15 @@ struct kvm_pre_fault_memory {
 	__u64 padding[5];
 };
 
+/* pv_sched: RT VM configuration */
+#define KVM_PV_SCHED_MAX_RT_VCPUS	256
+
+struct kvm_rt_vm_config {
+	__u32 vm_id;				/* RT VM 的全局 ID */
+	__u32 nr_vcpus;				/* vCPU 数量 */
+	__u32 pcpu_ids[KVM_PV_SCHED_MAX_RT_VCPUS];  /* vCPU i 绑定的 pCPU ID */
+};
+
+#define KVM_SET_RT_VM_CONFIG	_IOW(KVMIO,  0xd6, struct kvm_rt_vm_config)
+
 #endif /* __LINUX_KVM_H */

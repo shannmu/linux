@@ -32,3 +32,5 @@ obj-y += core.o
 obj-y += fair.o
 obj-y += build_policy.o
 obj-y += build_utility.o
+
+obj-$(CONFIG_PV_SCHED_GUEST) += pv_sched_guest.o

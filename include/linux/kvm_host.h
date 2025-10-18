@@ -401,6 +401,12 @@ struct kvm_vcpu {
 	 */
 	struct kvm_memory_slot *last_used_slot;
 	u64 last_used_slot_gen;
+
+#ifdef CONFIG_X86
+	/* pv_sched: RT vCPU pinning */
+	bool cpu_pinned;		/* 是否已绑定到 pCPU */
+	int pinned_pcpu;		/* 绑定的 pCPU ID */
+#endif
 };
 
 /*
@@ -863,6 +869,14 @@ struct kvm {
 	struct xarray mem_attr_array;
 #endif
 	char stats_id[KVM_STATS_NAME_SIZE];
+
+#ifdef CONFIG_X86
+	/* pv_sched: paravirtualized scheduling support */
+	struct cps_vm_table *pv_sched_table;	/* Linux VM 的 pv_sched_table */
+	bool is_rt_vm;				/* 是否为 RT VM */
+	u32 pv_sched_vm_id;			/* VM ID（用于调试和管理） */
+	struct kvm_rt_vm_config rt_config;	/* RT VM 配置 */
+#endif
 };
 
 #define kvm_err(fmt, ...) \

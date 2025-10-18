@@ -55,6 +55,10 @@
 #include "stats.h"
 #include "autogroup.h"
 
+#ifdef CONFIG_X86
+#include <linux/pv_sched_guest.h>
+#endif
+
 /*
  * The initial- and re-scaling of tunables is configurable
  *
@@ -8712,6 +8716,16 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 	 * required for stable ->cpus_allowed
 	 */
 	lockdep_assert_held(&p->pi_lock);
+
+#ifdef CONFIG_X86
+	/* pv_sched: 尝试使用 paravirtualized scheduling */
+	if (cps_guest_enabled()) {
+		int pv_cpu = cps_select_cpu(p, prev_cpu, wake_flags);
+		if (pv_cpu >= 0 && cpumask_test_cpu(pv_cpu, p->cpus_ptr))
+			return pv_cpu;
+		/* fallback to original logic */
+	}
+#endif
 	if (wake_flags & WF_TTWU) {
 		record_wakee(p);
 

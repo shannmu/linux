@@ -33,6 +33,7 @@
 #include "lapic.h"
 #include "xen.h"
 #include "smm.h"
+#include "pv_sched.h"
 
 #include <linux/clocksource.h>
 #include <linux/interrupt.h>
@@ -4980,6 +4981,12 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 {
 	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
 
+	/* RT vCPU 防迁移检查 */
+	if (vcpu->cpu_pinned && vcpu->pinned_pcpu != cpu) {
+		pr_warn_ratelimited("kvm_pv_sched: RT vCPU %d loaded on wrong pCPU %d (expected %d)\n",
+				    vcpu->vcpu_idx, cpu, vcpu->pinned_pcpu);
+	}
+
 	vcpu->arch.l1tf_flush_l1d = true;
 
 	if (vcpu->scheduled_out && pmu->version && pmu->event_count) {
@@ -7361,6 +7368,18 @@ set_pit2_out:
 			return -EFAULT;
 
 		r = kvm_vm_ioctl_set_msr_filter(kvm, &filter);
+		break;
+	}
+	case KVM_SET_RT_VM_CONFIG: {
+		struct kvm_rt_vm_config cfg;
+
+		r = -EFAULT;
+		if (copy_from_user(&cfg, argp, sizeof(cfg)))
+			break;
+
+		mutex_lock(&kvm->lock);
+		r = kvm_pv_sched_set_rt_vm_config(kvm, &cfg);
+		mutex_unlock(&kvm->lock);
 		break;
 	}
 	default:
@@ -10085,6 +10104,13 @@ unsigned long __kvm_emulate_hypercall(struct kvm_vcpu *vcpu, unsigned long nr,
 		/* stat is incremented on completion. */
 		return 0;
 	}
+	case KVM_HC_PV_SCHED_GET_TABLE_GPA:
+		/* pv_sched: 获取 pv_sched_table 的 GPA */
+		if (vcpu->kvm->pv_sched_table)
+			ret = vcpu->kvm->pv_sched_table->gpa;
+		else
+			ret = 0;  /* 没有 pv_sched_table */
+		break;
 	default:
 		ret = -KVM_ENOSYS;
 		break;
@@ -12430,6 +12456,70 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
 	kvfree(vcpu->arch.cpuid_entries);
 }
 
+/**
+ * kvm_arch_vcpu_run_pid_change - RT vCPU 线程属性设置
+ * @vcpu: vCPU
+ *
+ * 当 vCPU 的运行线程发生变化时调用（通常是首次运行）
+ * 对于 RT VM，这里设置第 3 层（CPU 亲和性）和第 4 层（SCHED_FIFO）隔离
+ *
+ * 返回值：0 成功，负数表示错误
+ */
+int kvm_arch_vcpu_run_pid_change(struct kvm_vcpu *vcpu)
+{
+	struct kvm *kvm = vcpu->kvm;
+	cpumask_var_t pcpu_mask;
+	struct sched_param param;
+	int pcpu_id;
+	int ret;
+
+	/* 只处理 RT VM */
+	if (!kvm->is_rt_vm)
+		return 0;
+
+	/* 获取此 vCPU 应该绑定的 pCPU */
+	if (vcpu->vcpu_idx >= kvm->rt_config.nr_vcpus) {
+		pr_err("kvm_pv_sched: RT vCPU %d exceeds configured count %u\n",
+		       vcpu->vcpu_idx, kvm->rt_config.nr_vcpus);
+		return -EINVAL;
+	}
+
+	pcpu_id = kvm->rt_config.pcpu_ids[vcpu->vcpu_idx];
+
+	/* 第 3 层隔离：CPU 亲和性绑定 */
+	if (!zalloc_cpumask_var(&pcpu_mask, GFP_KERNEL))
+		return -ENOMEM;
+
+	cpumask_set_cpu(pcpu_id, pcpu_mask);
+	ret = set_cpus_allowed_ptr(current, pcpu_mask);
+	if (ret) {
+		pr_err("kvm_pv_sched: failed to set CPU affinity for RT vCPU %d to pCPU %d: %d\n",
+		       vcpu->vcpu_idx, pcpu_id, ret);
+		free_cpumask_var(pcpu_mask);
+		return ret;
+	}
+
+	free_cpumask_var(pcpu_mask);
+
+	/* 第 4 层隔离：SCHED_FIFO 实时调度策略 */
+	param.sched_priority = 50;  /* 中等优先级，可以根据需求调整 */
+	ret = sched_setscheduler(current, SCHED_FIFO, &param);
+	if (ret) {
+		pr_err("kvm_pv_sched: failed to set SCHED_FIFO for RT vCPU %d: %d\n",
+		       vcpu->vcpu_idx, ret);
+		return ret;
+	}
+
+	/* 标记已绑定 */
+	vcpu->cpu_pinned = true;
+	vcpu->pinned_pcpu = pcpu_id;
+
+	pr_info("kvm_pv_sched: RT vCPU %d bound to pCPU %d with SCHED_FIFO priority %d\n",
+		vcpu->vcpu_idx, pcpu_id, param.sched_priority);
+
+	return 0;
+}
+
 void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 {
 	struct kvm_cpuid_entry2 *cpuid_0x1;
@@ -12796,7 +12886,17 @@ out:
 
 int kvm_arch_post_init_vm(struct kvm *kvm)
 {
+	int ret;
+
 	once_init(&kvm->arch.nx_once);
+
+	/* 初始化 pv_sched（仅 Linux VM） */
+	ret = kvm_pv_sched_init_vm(kvm);
+	if (ret) {
+		pr_err("kvm: failed to initialize pv_sched: %d\n", ret);
+		return ret;
+	}
+
 	return 0;
 }
 
@@ -12921,6 +13021,10 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
 		__x86_set_memory_region(kvm, TSS_PRIVATE_MEMSLOT, 0, 0);
 		mutex_unlock(&kvm->slots_lock);
 	}
+
+	/* 清理 pv_sched */
+	kvm_pv_sched_destroy_vm(kvm);
+
 	kvm_unload_vcpu_mmus(kvm);
 	kvm_destroy_vcpus(kvm);
 	kvm_x86_call(vm_destroy)(kvm);

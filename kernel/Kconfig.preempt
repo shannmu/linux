@@ -159,3 +159,21 @@ config SCHED_CLASS_EXT
 	  For more information:
 	    Documentation/scheduler/sched-ext.rst
 	    https://github.com/sched-ext/scx
+
+config PV_SCHED_GUEST
+	bool "Paravirtualized scheduling - Guest side"
+	depends on X86_64 && SMP && PARAVIRT
+	default n
+	help
+	  Enable paravirtualized scheduling support on the guest side.
+	  This allows a Linux guest VM running under KVM to use host-provided
+	  CPU load information for better scheduling decisions.
+
+	  Features:
+	  - Read pv_sched_table from host via shared memory
+	  - Use host CPU load info in CFS scheduler (select_task_rq_fair)
+	  - Support graceful migration when CPUs are allocated to RT VMs
+	  - Multi-dimensional CPU scoring (NUMA, LLC, load, capacity)
+
+	  Say Y if this kernel will run as a KVM guest with pv_sched support.
+	  Say N if unsure.

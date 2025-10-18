@@ -11,6 +11,7 @@ kvm-y			+= x86.o emulate.o i8259.o irq.o lapic.o \
 			   mmu/spte.o
 
 kvm-$(CONFIG_X86_64) += mmu/tdp_iter.o mmu/tdp_mmu.o
+kvm-$(CONFIG_PV_SCHED_HOST) += pv_sched.o pv_sched_host.o
 kvm-$(CONFIG_KVM_HYPERV) += hyperv.o
 kvm-$(CONFIG_KVM_XEN)	+= xen.o
 kvm-$(CONFIG_KVM_SMM)	+= smm.o

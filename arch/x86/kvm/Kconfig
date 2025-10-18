@@ -213,4 +213,23 @@ config KVM_MAX_NR_VCPUS
 	  the memory footprint of each KVM guest, regardless of how many vCPUs are
 	  created for a given VM.
 
+config PV_SCHED_HOST
+	bool "Paravirtualized scheduling - Host side"
+	depends on KVM && X86_64 && SMP
+	default n
+	help
+	  Enable paravirtualized scheduling support on the host side.
+	  This allows the host to share CPU load information with Linux guest VMs
+	  through shared memory tables, and supports RT VM isolation with
+	  1:1 CPU pinning and multi-layer isolation.
+
+	  Features:
+	  - Manage global pCPU state and allocation
+	  - Provide pv_sched_table to Linux guest VMs
+	  - Support RT VM CPU isolation and resource management
+	  - Periodic table updates (1-5ms configurable)
+
+	  Say Y if this kernel will run as a KVM host with pv_sched support.
+	  Say N if unsure.
+
 endif # VIRTUALIZATION
