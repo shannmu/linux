@@ -496,8 +496,11 @@ asmlinkage void noinstr do_irq(struct pt_regs *regs)
 {
 	irqentry_state_t state = irqentry_enter(regs);
 
-	if (IS_ENABLED(CONFIG_IRQ_STACKS) && on_thread_stack())
+	if (IS_ENABLED(CONFIG_IRQ_STACKS) && on_thread_stack() && !__this_cpu_read(irq_stack_inuse)) {
+		__this_cpu_write(irq_stack_inuse, true);
 		call_on_irq_stack(regs, handle_riscv_irq);
+		__this_cpu_write(irq_stack_inuse, false);
+	}
 	else
 		handle_riscv_irq(regs);
 

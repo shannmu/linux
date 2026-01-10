@@ -87,8 +87,11 @@ static void ___do_softirq(struct pt_regs *regs)
 
 void do_softirq_own_stack(void)
 {
-	if (on_thread_stack())
+	if (on_thread_stack() && !__this_cpu_read(irq_stack_inuse)) { 
+		__this_cpu_write(irq_stack_inuse, true);
 		call_on_irq_stack(NULL, ___do_softirq);
+		__this_cpu_write(irq_stack_inuse, false);
+	}
 	else
 		__do_softirq();
 }

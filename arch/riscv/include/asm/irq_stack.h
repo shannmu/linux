@@ -12,6 +12,8 @@
 
 DECLARE_PER_CPU(ulong *, irq_stack_ptr);
 
+static DEFINE_PER_CPU(bool, irq_stack_inuse);
+
 asmlinkage void call_on_irq_stack(struct pt_regs *regs,
 				  void (*func)(struct pt_regs *));
 

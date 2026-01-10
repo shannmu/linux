@@ -629,10 +629,10 @@ void evl_wakeup_thread(struct evl_thread *thread, int mask, int info)
 	struct evl_rq *rq;
 
 	rq = evl_get_thread_rq(thread, flags);
-	pr_info("EVL: evl_wakeup_thread: %s get_thread_rq on %d\n", thread->name);
+	// pr_info("EVL: evl_wakeup_thread: %s get_thread_rq\n", thread->name);
 	evl_wakeup_thread_locked(thread, mask, info);
 	evl_put_thread_rq(thread, rq, flags);
-	pr_info("EVL: evl_wakeup_thread: %s put_thread_rq on %d\n", thread->name);
+	// pr_info("EVL: evl_wakeup_thread: %s put_thread_rq\n", thread->name);
 }
 
 void evl_hold_thread(struct evl_thread *thread, int mask)
