@@ -85,6 +85,7 @@ static inline dma_addr_t dma_direct_map_page(struct device *dev,
 		enum dma_data_direction dir, unsigned long attrs)
 {
 	phys_addr_t phys = page_to_phys(page) + offset;
+	// TODO: lazydma hook here
 	dma_addr_t dma_addr = phys_to_dma(dev, phys);
 
 	if (is_swiotlb_force_bounce(dev)) {
