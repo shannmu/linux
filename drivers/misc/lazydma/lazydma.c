@@ -148,6 +148,8 @@ static void track_dma_map(phys_addr_t phys, size_t size)
 
 			/* Atomically increment mapped_count (lower 31 bits) */
 			do {
+				// TODO: touch mem to try to trigger ept page fault.
+
 				old_val = atomic_read(&entry->val);
 				old_count = old_val &
 					    0x7FFFFFFF; /* Get lower 31 bits */
