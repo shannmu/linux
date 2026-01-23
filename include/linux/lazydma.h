@@ -13,6 +13,8 @@
 
 #ifdef CONFIG_LAZYDMA
 
+#define MAX_VM_NUMS 256
+
 /**
  * lazydma_hook_device - Hook DMA operations for a specific device
  * @dev: Device to hook
