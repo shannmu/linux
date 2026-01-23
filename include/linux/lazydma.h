@@ -34,6 +34,34 @@ int lazydma_hook_device(struct device *dev);
  */
 void lazydma_unhook_device(struct device *dev);
 
+/* Use kernel's PMD_SHIFT and PMD_SIZE definitions */
+#ifndef PMD_SHIFT
+#define PMD_SHIFT 21
+#endif
+
+#ifndef PMD_SIZE
+#define PMD_SIZE (1UL << PMD_SHIFT)
+#endif
+
+#ifndef PMD_MASK
+#define PMD_MASK (~(PMD_SIZE - 1))
+#endif
+
+/* DMA tracking entry - 4 bytes per PMD */
+struct dma_tracking_entry {
+	union {
+		atomic_t val;
+		struct {
+			unsigned int mapped_count : 31;
+			unsigned int present : 1;
+		};
+	};
+} __packed;
+
+void lazydma_map(phys_addr_t gpa, size_t size);
+
+void lazydma_unmap(phys_addr_t gpa, size_t size);
+
 #else /* !CONFIG_LAZYDMA */
 
 static inline int lazydma_hook_device(struct device *dev)

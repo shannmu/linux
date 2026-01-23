@@ -278,15 +278,14 @@ static bool virtqueue_use_indirect(const struct vring_virtqueue *vq,
  * unconditionally on data path.
  */
 
-// NOTE: lazydma hook point
 static bool vring_use_dma_api(const struct virtio_device *vdev)
 {
 	if (!virtio_has_dma_quirk(vdev))
 		return true;
-	
 
-	// HACK: for lazydma debug
+#ifdef CONFIG_LAZYDMA
 	return true;
+#endif
 
 	/* Otherwise, we are left to guess. */
 	/*

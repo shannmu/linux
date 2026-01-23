@@ -7,8 +7,10 @@
 #ifndef _KERNEL_DMA_DIRECT_H
 #define _KERNEL_DMA_DIRECT_H
 
+#include "linux/types.h"
 #include <linux/dma-direct.h>
 #include <linux/memremap.h>
+#include <linux/lazydma.h>
 
 int dma_direct_get_sgtable(struct device *dev, struct sg_table *sgt,
 		void *cpu_addr, dma_addr_t dma_addr, size_t size,
@@ -80,7 +82,7 @@ static inline void dma_direct_sync_single_for_cpu(struct device *dev,
 		arch_dma_mark_clean(paddr, size);
 }
 
-static inline dma_addr_t dma_direct_map_page(struct device *dev,
+static inline dma_addr_t __dma_direct_map_page(struct device *dev,
 		struct page *page, unsigned long offset, size_t size,
 		enum dma_data_direction dir, unsigned long attrs)
 {
@@ -112,7 +114,21 @@ static inline dma_addr_t dma_direct_map_page(struct device *dev,
 	return dma_addr;
 }
 
-static inline void dma_direct_unmap_page(struct device *dev, dma_addr_t addr,
+static inline dma_addr_t dma_direct_map_page(struct device *dev,
+		struct page *page, unsigned long offset, size_t size,
+		enum dma_data_direction dir, unsigned long attrs)
+{
+	phys_addr_t phys = page_to_phys(page) + offset;
+
+	dma_addr_t dma_addr = __dma_direct_map_page(dev, page, offset, size, dir, attrs);
+
+#ifdef CONFIG_LAZYDMA
+	lazydma_map(phys, size);	
+#endif
+	return dma_addr;
+}
+
+static inline void __dma_direct_unmap_page(struct device *dev, dma_addr_t addr,
 		size_t size, enum dma_data_direction dir, unsigned long attrs)
 {
 	phys_addr_t phys = dma_to_phys(dev, addr);
@@ -122,5 +138,15 @@ static inline void dma_direct_unmap_page(struct device *dev, dma_addr_t addr,
 
 	swiotlb_tbl_unmap_single(dev, phys, size, dir,
 					 attrs | DMA_ATTR_SKIP_CPU_SYNC);
+}
+static inline void dma_direct_unmap_page(struct device *dev, dma_addr_t addr,
+		size_t size, enum dma_data_direction dir, unsigned long attrs)
+{
+	phys_addr_t phys = dma_to_phys(dev, addr);
+	__dma_direct_unmap_page(dev, addr,size, dir, attrs);
+
+#ifdef CONFIG_LAZYDMA
+	lazydma_unmap(phys, size);
+#endif
 }
 #endif /* _KERNEL_DMA_DIRECT_H */
