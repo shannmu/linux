@@ -3,4 +3,4 @@
 # Makefile for Lazy DMA driver
 #
 
-obj-$(CONFIG_LAZYDMA) += lazydma.o reclaim.o
+obj-$(CONFIG_LAZYDMA) += lazydma.o

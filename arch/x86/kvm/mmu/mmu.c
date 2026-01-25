@@ -4514,6 +4514,7 @@ static int kvm_tdp_mmu_page_fault(struct kvm_vcpu *vcpu,
 
 out_unlock:
 	read_unlock(&vcpu->kvm->mmu_lock);
+	// TODO: hook here
 	kvm_release_pfn_clean(fault->pfn);
 	return r;
 }

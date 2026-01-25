@@ -124,6 +124,31 @@ static inline bool check_present_bit(struct dma_tracking_entry *entry)
 // 	return false;
 // }
 
+static inline void __touch_mem(phys_addr_t phys, size_t size)
+{
+	if (unlikely(size == 0))
+		return;
+
+	/* 找到第一个有交集的 PMD 的起始物理地址 */
+	phys_addr_t curr_phys = phys & PMD_MASK;
+
+	/* 找到最后一个有交集的 PMD 的起始物理地址 */
+	phys_addr_t last_phys = (phys + size - 1) & PMD_MASK;
+
+	/* 遍历每一个涉及到的 PMD */
+	do {
+		/* * 1. __va() 将物理地址转为直接映射区虚拟地址 
+		* 2. 强转为 (char *) 指向首字节
+		* 3. READ_ONCE 确保触发实际的内存读取指令
+		*/
+		(void)READ_ONCE(*(char *)__va(curr_phys));
+
+		/* 移动到下一个 PMD */
+		curr_phys += PMD_SIZE;
+
+	} while (curr_phys <= last_phys);
+}
+
 /*
  * Track DMA mapping for a physical address range
  */
@@ -149,6 +174,7 @@ static void track_dma_map(phys_addr_t phys, size_t size)
 			/* Atomically increment mapped_count (lower 31 bits) */
 			do {
 				// TODO: touch mem to try to trigger ept page fault.
+				__touch_mem(phys, size);
 
 				old_val = atomic_read(&entry->val);
 				old_count = old_val &
@@ -501,10 +527,6 @@ static int __init lazydma_init(void)
 
 	/* Prepare DMA operation hooks */
 	hook_dma_ops();
-
-	/* Register misc device */
-	lazydma.miscdev.minor = MISC_DYNAMIC_MINOR;
-	lazydma.miscdev.name = LAZYDMA_NAME;
 
 	lazydma.initialized = true;
 

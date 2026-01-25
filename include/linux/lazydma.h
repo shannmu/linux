@@ -13,7 +13,13 @@
 
 #ifdef CONFIG_LAZYDMA
 
+
+#define MY_IOC_MAGIC 'q'
+
 #define MAX_VM_NUMS 256
+
+#define TRACKING_TABLE_ADDR 0x10000000000UL
+#define TRACKING_TABLE_SIZE 0x200000UL
 
 /**
  * lazydma_hook_device - Hook DMA operations for a specific device
@@ -60,9 +66,27 @@ struct dma_tracking_entry {
 	};
 } __packed;
 
+struct lazydma_memory_region {
+    __u64 userspace_addr;    /* HVA */
+    __u64 guest_phys_addr;   /* GPA */
+    __u64 size;              /* Size */
+    __u64 flags;             /* 比如是否只读 */
+};
+
+/* 变长结构体，或者你分多次下发 */
+struct lazydma_mem_table {
+    __u32 nregions;
+    __u32 padding;
+    struct lazydma_memory_region regions[0]; /* 变长数组 */
+};
+
+#define LAZYDMA_SET_MEMTABLE _IOW(MY_IOC_MAGIC, 1, struct lazydma_mem_table)
+
 void lazydma_map(phys_addr_t gpa, size_t size);
 
 void lazydma_unmap(phys_addr_t gpa, size_t size);
+
+void lazydma_notify_page_fault(void);
 
 #else /* !CONFIG_LAZYDMA */
 
