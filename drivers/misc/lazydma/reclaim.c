@@ -1,4 +1,10 @@
-#include "linux/lazydma.h"
+#include "asm/pgtable_64_types.h"
+#include "linux/kvm_types.h"
+#include "linux/lockdep.h"
+#include "linux/mutex.h"
+#include "linux/mutex_types.h"
+#include "linux/rcupdate.h"
+#include <linux/mmu_notifier.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
@@ -11,18 +17,11 @@
 #include <linux/mm_inline.h> /* for folio_isolate_lru if inline */
 #include <linux/ioctl.h>
 #include <linux/types.h>
+#include <linux/vmalloc.h>
 
-#define MY_IOC_MAGIC 'q'
 
-// 传递的数据结构
-struct lazydma_shm_config {
-	__u64 addr; // 用户态虚拟地址 (HVA / vaddr)
-	__u64 size; // 共享内存大小 (bytes)
-	__u64 padding; // 保留字段，用于字节对齐或未来扩展
-};
-
-// 定义 IOCTL 命令：_IOW 表示用户态向内核写数据
-#define LAZYDMA_SET_SHM_CONFIG _IOW(MY_IOC_MAGIC, 1, struct lazydma_shm_config)
+#include "linux/lazydma.h"
+#include <stdatomic.h>
 
 /* * 注意：reclaim_pages 在 mm/vmscan.c 中定义。
  * 如果它在你的内核源码中是 static 的，你需要去 mm/vmscan.c 去掉 static，
@@ -30,6 +29,7 @@ struct lazydma_shm_config {
  * 这里我们手动声明一下。
  */
 extern unsigned long reclaim_pages(struct list_head *folio_list);
+extern bool folio_isolate_lru(struct folio *folio);
 
 /* 你的自定义接口 */
 extern bool pmd_check_io(pmd_t *pmd);
@@ -44,10 +44,161 @@ struct lazydma_ctx {
 	struct mm_struct *target_mm;
 	struct dma_tracking_entry *entrys;
 	wait_queue_head_t wq;
+	struct mmu_notifier mn;
 	bool stop_req;
+
+	struct mutex mt_lock;
+	struct __rcu lazydma_mem_table *mem_table;
 };
 
 static struct lazydma_ctx vm_ctx_pool[MAX_VM_NUMS];
+
+static bool is_pmd_mapped(struct mm_struct *mm, unsigned long addr)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+
+	/* 注意：调用此函数时，caller (notifier) 已经持有 mmap_lock (通常是 write lock) */
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return false;
+
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return false;
+
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return false;
+
+	pmd = pmd_offset(pud, addr);
+	/* 关键判断：如果是 Present 且不是 HugePage 的 split 状态 */
+	if (pmd_present(*pmd) && !is_swap_pmd(*pmd)) {
+		return true;
+	}
+
+	return false;
+}
+
+#define LAZYDMA_INVALID_ADDR (~0ULL)
+
+static inline gpa_t hva_to_gpa(struct lazydma_mem_table *mem_table, hva_t hva)
+{
+	int i;
+	struct lazydma_memory_region *reg;
+
+	if (!mem_table)
+		return LAZYDMA_INVALID_ADDR;
+
+	/* 线性遍历 Memtable */
+	for (i = 0; i < mem_table->nregions; i++) {
+		reg = &mem_table->regions[i];
+
+		/* 判断 hva 是否在当前 region 区间内: [start, start + size) */
+		if (hva >= reg->userspace_addr && 
+			hva < (reg->userspace_addr + reg->size)) {
+			
+			/* 计算偏移量并加上 GPA 基地址 */
+			return reg->guest_phys_addr + (hva - reg->userspace_addr);
+		}
+	}
+
+	return LAZYDMA_INVALID_ADDR;
+}
+
+static inline hva_t gpa_to_hva(struct lazydma_mem_table *mem_table, gpa_t gpa)
+{
+	int i;
+	struct lazydma_memory_region *reg;
+
+	if (!mem_table)
+		return LAZYDMA_INVALID_ADDR;
+
+	for (i = 0; i < mem_table->nregions; i++) {
+		reg = &mem_table->regions[i];
+
+		/* 判断 gpa 是否在当前 region 区间内 */
+		if (gpa >= reg->guest_phys_addr && 
+			gpa < (reg->guest_phys_addr + reg->size)) {
+			
+			/* 计算偏移量并加上 HVA 基地址 */
+			return reg->userspace_addr + (gpa - reg->guest_phys_addr);
+		}
+	}
+
+	return LAZYDMA_INVALID_ADDR;
+}
+
+
+static struct dma_tracking_entry* get_entry(struct lazydma_ctx *ctx, hva_t addr)
+{
+	struct lazydma_mem_table *mem_table = NULL;
+	struct dma_tracking_entry *entrys = ctx->entrys;
+	gpa_t gpa;
+	unsigned int index;
+
+	rcu_read_lock();
+	mem_table = rcu_dereference(ctx->mem_table);
+	gpa = hva_to_gpa(mem_table, addr);
+	index = gpa >> PMD_SHIFT;
+	rcu_read_unlock();
+
+	return &entrys[index];
+}
+
+static int
+lazydma_mn_invalidate_range_start(struct mmu_notifier *mn,
+				  const struct mmu_notifier_range *range)
+{
+	struct lazydma_ctx *ctx = container_of(mn, struct lazydma_ctx, mn);
+	unsigned long addr;
+
+	/* 1. 先置 0 (悲观策略) */
+	for (addr = range->start; addr < range->end; addr += PMD_SIZE) {
+		struct dma_tracking_entry *entry = get_entry(ctx, addr);
+		if (entry) {
+			atomic_fetch_and(0x7fffffff, &entry->val);
+		}
+	}
+	return 0;
+}
+
+static void
+lazydma_mn_invalidate_range_end(struct mmu_notifier *mn,
+				const struct mmu_notifier_range *range)
+{
+	struct lazydma_ctx *ctx = container_of(mn, struct lazydma_ctx, mn);
+	unsigned long addr;
+
+	/* 2. 检查并回滚 (Rollback) */
+	for (addr = range->start; addr < range->end; addr += PMD_SIZE) {
+		/* * 再次检查页表状态 
+		* range->mm 是当前操作的 mm_struct，通常已经上锁
+		*/
+		// TODO: 确认这个逻辑可以保障事务性
+		if (is_pmd_mapped(range->mm, addr)) {
+			struct dma_tracking_entry *entry =
+				get_entry(ctx, addr);
+			if (entry && entry->present == 0) {
+				entry->present = 1; /* 恢复为 1 */
+				wmb();
+			}
+		}
+	}
+}
+
+static const struct mmu_notifier_ops lazydma_mn_ops = {
+	.invalidate_range_start = lazydma_mn_invalidate_range_start,
+	.invalidate_range_end = lazydma_mn_invalidate_range_end,
+};
+
+// TODO: neet to 确定参数, 参数用于index到ctx
+void lazydma_notify_page_fault(void)
+{
+
+}
 
 /*
  * 页表遍历回调 (PMD Level)
@@ -167,8 +318,6 @@ static int lazydma_worker(void *data)
 			ctx->wq, kthread_should_stop() || ctx->stop_req, HZ);
 	}
 
-	/* 线程结束，释放 mm 引用 */
-	mmput(ctx->target_mm);
 	return 0;
 }
 
@@ -201,7 +350,6 @@ static int lazydma_open(struct inode *inode, struct file *file)
 	ctx->thread = NULL;
 	ctx->target_mm = NULL;
 	ctx->entrys = NULL;
-	init_waitqueue_head(&ctx->wq);
 
 	/* 3. 获取 mm */
 	if (!current->mm) {
@@ -211,6 +359,10 @@ static int lazydma_open(struct inode *inode, struct file *file)
 
 	mmget(current->mm);
 	ctx->target_mm = current->mm;
+
+	init_waitqueue_head(&ctx->wq);
+	ctx->mn.ops = &lazydma_mn_ops;
+	mmu_notifier_register(&ctx->mn, ctx->target_mm);
 
 	/* 4. 启动线程 */
 	ctx->thread = kthread_run(lazydma_worker, ctx, "lazydma/%d", ctx->id);
@@ -248,9 +400,9 @@ static int lazydma_release(struct inode *inode, struct file *file)
 		ctx->thread = NULL;
 	}
 
-	/* * 注意：mmput 已经在 worker 线程退出前调用了，这里不需要再调。
-	* 除非 kthread_run 失败的路径（已经在 open 里处理了）。
-	*/
+	/* 线程结束，释放 mm 引用 */
+	mmu_notifier_unregister(&ctx->mn, ctx->target_mm);
+	mmput(ctx->target_mm);
 
 	pr_info("lazydma: Released device for VM %d\n", ctx->id);
 
@@ -262,27 +414,65 @@ static int lazydma_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static int update_lazydma_mem_table(struct lazydma_ctx *ctx, struct lazydma_mem_table *new, u64 full_size)
+{
+	int ret = 0;
+
+	struct lazydma_mem_table *old = NULL;
+	struct lazydma_mem_table *tmp = vzalloc(full_size);
+	memcpy(tmp, new, full_size);
+
+	mutex_lock(&ctx->mt_lock);
+	old = rcu_dereference_protected(ctx->mem_table, lock_is_held(&ctx->mt_lock));
+	rcu_assign_pointer(ctx->mem_table, tmp);
+	mutex_unlock(&ctx->mt_lock);
+
+	synchronize_rcu();
+
+	vfree(old);
+
+	if (ctx->entrys == NULL) {
+			
+	}
+	return ret;
+}
+
 static long lazydma_ioctl(struct file *filp, unsigned int cmd,
 			  unsigned long arg)
 {
 	struct lazydma_ctx *ctx = filp->private_data;
-	struct lazydma_shm_config config;
 
 	if (!ctx)
 		return -ENODEV;
 
 	switch (cmd) {
-	case LAZYDMA_SET_SHM_CONFIG:
-		if (copy_from_user(&config, (void __user *)arg,
-				   sizeof(config))) {
+	case LAZYDMA_SET_MEMTABLE:
+		struct lazydma_mem_table header;
+		struct lazydma_mem_table *full_table;
+		u64 full_size;
+
+		/* 1. 先读头部，获取 nregions */
+		if (copy_from_user(&header, (void __user *)arg, sizeof(header)))
+			return -EFAULT;
+
+		/* 2. 分配内核内存读取整个表 */
+		full_size = sizeof(header) + header.nregions * sizeof(struct lazydma_memory_region);
+		full_table = vmalloc(full_size);
+		if (!full_table) return -ENOMEM;
+
+		if (copy_from_user(full_table, (void __user *)arg, full_size)) {
+			vfree(full_table);
 			return -EFAULT;
 		}
-		pr_info("lazydma: VM %d config set: addr 0x%llx size %llu\n",
-			ctx->id, config.addr, config.size);
 
-		/* TODO: 这里可以将 config 保存到 ctx 中，
-		* 供 lazydma_scan_mm 使用以缩小扫描范围 
+		/* 3. 更新 ctx 中的内存映射表 */
+		/* * 注意：这里需要并发保护 (mutex)。
+		* 建议：释放旧的 map，建立新的 map。
+		* 遍历 full_table->regions[i]，保存 {gpa, hva, size} 到内核结构体中。
 		*/
+		update_lazydma_mem_table(ctx, full_table, full_size);
+
+		vfree(full_table);
 		break;
 	default:
 		return -EINVAL;
