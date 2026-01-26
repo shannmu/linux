@@ -23,3 +23,17 @@ config LAZYDMA
 
 	  Say Y or M if you are running in a VM and want to use lazy DMA
 	  tracking features. If unsure, say N.
+
+# used in guest
+config LAZYDMA_HUGEPAGE_PMD
+	tristate "Lazy DMA use hugepage in EPT"
+	depends on LAZYDMA
+	help
+		Lazy DMA use hugepage in EPT
+
+# used in host
+config LAZYDMA_PTE_MODE
+	tristate "Lazy DMA use PTE in EPT"
+	depends on LAZYDMA
+	help
+		Lazy DMA use PTE in EPT

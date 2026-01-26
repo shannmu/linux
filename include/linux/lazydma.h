@@ -21,6 +21,20 @@
 #define TRACKING_TABLE_ADDR 0x10000000000UL
 #define TRACKING_TABLE_SIZE 0x200000UL
 
+#ifdef CONFIG_LAZYDMA_HUGEPAGE
+
+#define TRACKING_MEM_SIZE PMD_SIZE
+#define TRACKING_MEM_SHIFT PMD_SHIFT
+#define TRACKING_MEM_MASK PMD_MASK
+
+#else
+
+#define TRACKING_MEM_SIZE PAGE_SIZE
+#define TRACKING_MEM_SHIFT PAGE_SHIFT
+#define TRACKING_MEM_MASK PAGE_MASK
+
+#endif
+
 /**
  * lazydma_hook_device - Hook DMA operations for a specific device
  * @dev: Device to hook
