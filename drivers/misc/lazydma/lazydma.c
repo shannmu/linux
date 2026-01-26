@@ -130,10 +130,10 @@ static inline void __touch_mem(phys_addr_t phys, size_t size)
 		return;
 
 	/* 找到第一个有交集的 PMD 的起始物理地址 */
-	phys_addr_t curr_phys = phys & PMD_MASK;
+	phys_addr_t curr_phys = phys & TRACKING_MEM_MASK;
 
 	/* 找到最后一个有交集的 PMD 的起始物理地址 */
-	phys_addr_t last_phys = (phys + size - 1) & PMD_MASK;
+	phys_addr_t last_phys = (phys + size - 1) & TRACKING_MEM_MASK;
 
 	/* 遍历每一个涉及到的 PMD */
 	do {
@@ -144,7 +144,7 @@ static inline void __touch_mem(phys_addr_t phys, size_t size)
 		(void)READ_ONCE(*(char *)__va(curr_phys));
 
 		/* 移动到下一个 PMD */
-		curr_phys += PMD_SIZE;
+		curr_phys += TRACKING_MEM_SIZE;
 
 	} while (curr_phys <= last_phys);
 }
@@ -155,17 +155,17 @@ static inline void __touch_mem(phys_addr_t phys, size_t size)
 static void track_dma_map(phys_addr_t phys, size_t size)
 {
 	phys_addr_t end = phys + size;
-	phys_addr_t pmd_start, pmd_end;
+	phys_addr_t start;
 
 	if (!lazydma.initialized)
 		return;
 
 	/* Align to PMD boundaries */
-	pmd_start = phys & PMD_MASK;
-	pmd_end = (end + PMD_SIZE - 1) & PMD_MASK;
+	start = phys & TRACKING_MEM_MASK;
+	end = (end + TRACKING_MEM_SIZE - 1) & TRACKING_MEM_MASK;
 
 	/* Track each PMD */
-	for (phys_addr_t addr = pmd_start; addr < pmd_end; addr += PMD_SIZE) {
+	for (phys_addr_t addr = start; addr < end; addr += TRACKING_MEM_SIZE) {
 		struct dma_tracking_entry *entry = get_tracking_entry(addr);
 		if (entry) {
 			unsigned int old_val, new_val;
@@ -203,17 +203,17 @@ static void track_dma_map(phys_addr_t phys, size_t size)
 static void track_dma_unmap(phys_addr_t phys, size_t size)
 {
 	phys_addr_t end = phys + size;
-	phys_addr_t pmd_start, pmd_end;
+	phys_addr_t start;
 
 	if (!lazydma.initialized)
 		return;
 
 	/* Align to PMD boundaries */
-	pmd_start = phys & PMD_MASK;
-	pmd_end = (end + PMD_SIZE - 1) & PMD_MASK;
+	start = phys & TRACKING_MEM_MASK;
+	end = (end + TRACKING_MEM_SIZE - 1) & TRACKING_MEM_MASK;
 
 	/* Untrack each PMD */
-	for (phys_addr_t addr = pmd_start; addr < pmd_end; addr += PMD_SIZE) {
+	for (phys_addr_t addr = start; addr < end; addr += TRACKING_MEM_SIZE ) {
 		struct dma_tracking_entry *entry = get_tracking_entry(addr);
 		if (entry) {
 			unsigned int old_val, new_val;

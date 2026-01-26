@@ -21,7 +21,19 @@
 
 
 #include "linux/lazydma.h"
-#include <stdatomic.h>
+
+#ifdef CONFIG_LAZYDMA_PTE_MODE
+	#define LAZYDMA_SHIFT    PAGE_SHIFT
+	#define LAZYDMA_SIZE     PAGE_SIZE
+	/* PTE 模式下的步进 */
+	#define LAZYDMA_WALK_STEP PAGE_SIZE
+#else
+	#define LAZYDMA_SHIFT    PMD_SHIFT
+	#define LAZYDMA_SIZE     PMD_SIZE
+	/* PMD 模式下的步进 */
+	#define LAZYDMA_WALK_STEP PMD_SIZE
+#endif
+
 
 /* * 注意：reclaim_pages 在 mm/vmscan.c 中定义。
  * 如果它在你的内核源码中是 static 的，你需要去 mm/vmscan.c 去掉 static，
@@ -33,6 +45,7 @@ extern bool folio_isolate_lru(struct folio *folio);
 
 /* 你的自定义接口 */
 extern bool pmd_check_io(pmd_t *pmd);
+extern bool pte_check_io(pte_t *pte);
 
 #define DEVICE_NAME "lazydma"
 
@@ -53,34 +66,77 @@ struct lazydma_ctx {
 
 static struct lazydma_ctx vm_ctx_pool[MAX_VM_NUMS];
 
-static bool is_pmd_mapped(struct mm_struct *mm, unsigned long addr)
+
+/* --------------------------------------------------------------------------
+ * 页表状态检查 (is_mapped)
+ * -------------------------------------------------------------------------- */
+
+/* 通用 Helper：获取 PMD */
+static pmd_t *get_pmd_fast(struct mm_struct *mm, unsigned long addr)
 {
 	pgd_t *pgd;
 	p4d_t *p4d;
 	pud_t *pud;
-	pmd_t *pmd;
 
-	/* 注意：调用此函数时，caller (notifier) 已经持有 mmap_lock (通常是 write lock) */
 	pgd = pgd_offset(mm, addr);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
-		return false;
+	if (pgd_none(*pgd) || pgd_bad(*pgd)) return NULL;
 
 	p4d = p4d_offset(pgd, addr);
-	if (p4d_none(*p4d) || p4d_bad(*p4d))
-		return false;
+	if (p4d_none(*p4d) || p4d_bad(*p4d)) return NULL;
 
 	pud = pud_offset(p4d, addr);
-	if (pud_none(*pud) || pud_bad(*pud))
-		return false;
+	if (pud_none(*pud) || pud_bad(*pud)) return NULL;
 
-	pmd = pmd_offset(pud, addr);
-	/* 关键判断：如果是 Present 且不是 HugePage 的 split 状态 */
+	return pmd_offset(pud, addr);
+}
+
+#ifndef CONFIG_LAZYDMA_PTE_MODE
+/* PMD 模式检查 */
+static bool is_target_mapped(struct mm_struct *mm, unsigned long addr)
+{
+	pmd_t *pmd = get_pmd_fast(mm, addr);
+	
+	if (!pmd) return false;
+
+	/* 检查 PMD 是否存在且不是 swap entry */
 	if (pmd_present(*pmd) && !is_swap_pmd(*pmd)) {
 		return true;
 	}
-
 	return false;
 }
+#else
+/* PTE 模式检查 */
+static bool is_target_mapped(struct mm_struct *mm, unsigned long addr)
+{
+	pmd_t *pmd;
+	pte_t *pte;
+	spinlock_t *ptl;
+	bool is_present = false;
+
+	pmd = get_pmd_fast(mm, addr);
+	if (!pmd || pmd_none(*pmd) || pmd_bad(*pmd)) 
+		return false;
+
+	/* * 注意：如果是 THP (Huge Page)，但在 PTE 模式下被当作 4K 处理，
+	 * 这里需要额外逻辑。通常如果配置了 PTE 模式，应尽量避免 THP 
+	 * 或者在这里拆分处理。简化起见，我们假设是标准的 PTE 映射。
+	 */
+	if (pmd_trans_huge(*pmd)) {
+		/* 如果是透明大页，且我们在 PTE 模式，视为已映射 */
+		return true; 
+	}
+
+	/* 获取 PTE */
+	pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!pte) return false;
+
+	if (pte_present(*pte))
+		is_present = true;
+
+	pte_unmap_unlock(pte, ptl);
+	return is_present;
+}
+#endif
 
 #define LAZYDMA_INVALID_ADDR (~0ULL)
 
@@ -155,9 +211,11 @@ lazydma_mn_invalidate_range_start(struct mmu_notifier *mn,
 	struct lazydma_ctx *ctx = container_of(mn, struct lazydma_ctx, mn);
 	unsigned long addr;
 
-	/* 1. 先置 0 (悲观策略) */
-	for (addr = range->start; addr < range->end; addr += PMD_SIZE) {
-		struct dma_tracking_entry *entry = get_entry(ctx, addr);
+	/* 步进改为 LAZYDMA_WALK_STEP (PMD_SIZE 或 PAGE_SIZE) */
+	for (addr = range->start; addr < range->end; addr += LAZYDMA_WALK_STEP) {
+		/* 对齐地址，防止非对齐的 range start */
+		unsigned long aligned_addr = addr & ~(LAZYDMA_SIZE - 1);
+		struct dma_tracking_entry *entry = get_entry(ctx, aligned_addr);
 		if (entry) {
 			atomic_fetch_and(0x7fffffff, &entry->val);
 		}
@@ -172,17 +230,16 @@ lazydma_mn_invalidate_range_end(struct mmu_notifier *mn,
 	struct lazydma_ctx *ctx = container_of(mn, struct lazydma_ctx, mn);
 	unsigned long addr;
 
-	/* 2. 检查并回滚 (Rollback) */
-	for (addr = range->start; addr < range->end; addr += PMD_SIZE) {
-		/* * 再次检查页表状态 
-		* range->mm 是当前操作的 mm_struct，通常已经上锁
-		*/
+	for (addr = range->start; addr < range->end; addr += LAZYDMA_WALK_STEP) {
+		unsigned long aligned_addr = addr & ~(LAZYDMA_SIZE - 1);
+		
+		/* 使用适配模式的 is_target_mapped */
 		// TODO: 确认这个逻辑可以保障事务性
-		if (is_pmd_mapped(range->mm, addr)) {
+		if (is_target_mapped(range->mm, aligned_addr)) {
 			struct dma_tracking_entry *entry =
-				get_entry(ctx, addr);
+				get_entry(ctx, aligned_addr);
 			if (entry && entry->present == 0) {
-				entry->present = 1; /* 恢复为 1 */
+				entry->present = 1;
 				wmb();
 			}
 		}
@@ -200,55 +257,65 @@ void lazydma_notify_page_fault(void)
 
 }
 
-/*
- * 页表遍历回调 (PMD Level)
+/* --------------------------------------------------------------------------
+ * Page Walk & Reclaim 逻辑
+ * -------------------------------------------------------------------------- */
+
+/* * 提取公共逻辑：尝试隔离并添加 Folio 到列表 
  */
+static void lazydma_isolate_and_add(struct page *page, struct list_head *folio_list)
+{
+	struct folio *folio;
+
+	if (!page) return;
+	
+	folio = page_folio(page);
+	if (!folio_try_get(folio))
+		return;
+
+	if (folio_isolate_lru(folio)) {
+		list_add_tail(&folio->lru, folio_list);
+	} else {
+		folio_put(folio);
+	}
+}
+
+/* PMD 模式回调 (Huge Page) */
 static int lazydma_pmd_entry(pmd_t *pmd, unsigned long addr, unsigned long next,
 			     struct mm_walk *walk)
 {
 	struct list_head *folio_list = walk->private;
-	struct page *page;
-	struct folio *folio;
 
-	/* 1. 基础有效性检查 */
 	if (!pmd_present(*pmd) || pmd_none(*pmd))
 		return 0;
 
-	/* 2. 调用你的业务逻辑：判断是否被 DMA 占用 */
-	/* * 注意：此时一定要确保 pmd_check_io 内部不要睡眠，
-	* 或者如果需要睡眠，确保锁的顺序是安全的。
-	* 此时我们持有 mmap_read_lock。
-	*/
-	if (!pmd_check_io(pmd)) {
-		return 0; /* 正在使用，不可回收 */
-	}
+	/* 业务 Check */
+	if (!pmd_check_io(pmd))
+		return 0;
 
-	/* 3. 获取 struct page */
-	page = pmd_page(*pmd);
+	lazydma_isolate_and_add(pmd_page(*pmd), folio_list);
+	return 0;
+}
+
+/* PTE 模式回调 (4K Page) */
+static int lazydma_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
+			     struct mm_walk *walk)
+{
+	struct list_head *folio_list = walk->private;
+	struct page *page;
+
+	if (!pte_present(*pte))
+		return 0;
+
+	/* 业务 Check (你需要实现 pte_check_io) */
+	if (!pte_check_io(pte))
+		return 0;
+
+	page = vm_normal_page(walk->vma, addr, *pte);
 	if (!page)
 		return 0;
 
-	/* 转换为 folio (Kernel 6.12 标准) */
-	folio = page_folio(page);
-
-	/* * 4. 尝试获取 Folio 引用
-	* 如果 folio refcount 为 0，说明已经在释放中，跳过
-	*/
-	if (!folio_try_get(folio))
-		return 0;
-
-	/* * 5. 核心步骤：隔离 LRU
-	* 只有在 LRU 链表上的页面才能被 Swap。
-	* folio_isolate_lru 会将页面移出全局 LRU，变为私有状态。
-	*/
-	if (folio_isolate_lru(folio)) {
-		/* 隔离成功，加入本地列表，准备交给 reclaim_pages */
-		list_add_tail(&folio->lru, folio_list);
-	} else {
-		/* 隔离失败 (可能被锁住、不在 LRU 上等)，释放引用 */
-		folio_put(folio);
-	}
-
+	lazydma_isolate_and_add(page, folio_list);
 	return 0;
 }
 
