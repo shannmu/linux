@@ -769,6 +769,31 @@ TRACE_EVENT(sched_wake_idle_without_ipi,
 	TP_printk("cpu=%d", __entry->cpu)
 );
 
+TRACE_EVENT(sched_deadline_miss,
+	/* 参数：任务结构体，当前截止时间，当前时间 */
+	TP_PROTO(struct task_struct *t, u64 dl_deadline, u64 now),
+
+	TP_ARGS(t, dl_deadline, now),
+
+	TP_STRUCT__entry(
+		__field( pid_t,   pid      )
+		__field( u64,     deadline )
+		__field( u64,     now      )
+		__field( s64,     lateness )
+	),
+
+	TP_fast_assign(
+		__entry->pid      = t->pid;
+		__entry->deadline = dl_deadline;
+		__entry->now      = now;
+		/* 计算 lateness: now - deadline */
+		__entry->lateness = (s64)(now - dl_deadline);
+	),
+
+	TP_printk("pid=%d deadline=%llu now=%llu lateness=%lld",
+		__entry->pid, __entry->deadline, __entry->now, __entry->lateness)
+);
+
 /*
  * Following tracepoints are not exported in tracefs and provide hooking
  * mechanisms only for testing and debugging purposes.

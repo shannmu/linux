@@ -1947,6 +1947,7 @@ static void update_curr_dl(struct rq *rq)
 	struct task_struct *curr = rq->curr;
 	struct sched_dl_entity *dl_se = &curr->dl;
 	s64 delta_exec;
+	u64 now;
 
 	if (!dl_task(curr) || !on_dl_rq(dl_se))
 		return;
@@ -1961,6 +1962,18 @@ static void update_curr_dl(struct rq *rq)
 	 */
 	delta_exec = update_curr_common(rq);
 	update_curr_dl_se(rq, dl_se, delta_exec);
+
+	now = rq_clock(rq); // 获取当前 RQ 时钟
+
+	/* * 判断是否 Miss: 
+	* 使用 dl_time_before 宏 (相当于 deadline < now)
+	* 这里的逻辑是：只要当前时刻超过了 deadline，就触发 trace。
+	* 由于任务在 miss 后还会继续运行，这个 trace 会被频繁触发，
+	* 我们交给 eBPF 去做去重。
+	*/
+	if (unlikely(dl_time_before(dl_se->deadline, now))) {
+		trace_sched_deadline_miss(curr, dl_se->deadline, now);
+	}
 }
 
 static enum hrtimer_restart inactive_task_timer(struct hrtimer *timer)
