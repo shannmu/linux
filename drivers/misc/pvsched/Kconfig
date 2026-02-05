@@ -1,0 +1,12 @@
+config PV_SCHED_HOST
+	tristate "Para-virtualized Scheduler Host-side support"
+	depends on X86_64 || ARM64
+	default n
+	help
+	  This option enables a character device (/dev/pvsched) that allows
+	  QEMU to coordinate scheduling with the host kernel. It maps a 
+	  specific user-space address range into the kernel for direct 
+	  metadata access.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called pvsched_host.
