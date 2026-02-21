@@ -10,3 +10,10 @@ config PV_SCHED_HOST
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called pvsched_host.
+
+config PV_SCHED_GUEST
+	tristate "Para-virtualized Scheduler Guest-side support"
+	depends on X86_64 || ARM64
+	default n
+	help
+	  TODO
