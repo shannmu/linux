@@ -12,16 +12,17 @@
 #include <linux/uaccess.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
+#include <linux/cpu.h>
 
 #include "pvsched.h"
 
 #define PVSCHED_START_ADDR 0x10000000000UL
-#define PVSCHED_MAX_VCPU 16
+#define PVSCHED_DEFAULT_INTERVAL_NS 100000000ULL
 
 /* ioctl 命令定义（同步写入 pvsched.h 供用户态使用）
  *
- * PVSCHED_INIT: arg = struct pvsched_init_args *，启动定时器和 worker 线程
- * PVSCHED_EXIT: arg 忽略，停止定时器和 worker 线程
+ * PVSCHED_INIT: arg = struct pvsched_init_args *，将该 VM 纳入全局配额计算
+ * PVSCHED_EXIT: arg 忽略，将该 VM 移出全局配额计算
  */
 #define PVSCHED_MAGIC 'P'
 #define PVSCHED_INIT _IOW(PVSCHED_MAGIC, 0, struct pvsched_init_args)
@@ -30,8 +31,7 @@
 /* entry 的运行状态，由 ioctl 驱动流转 */
 enum pvsched_state {
 	PVSCHED_STATE_IDLE, /* open 后尚未 INIT */
-	PVSCHED_STATE_ACTIVE, /* INIT 成功，timer/worker 运行中 */
-	PVSCHED_STATE_STOPPED, /* EXIT 后，等待 release 清理 */
+	PVSCHED_STATE_ACTIVE, /* INIT 成功，纳入全局配额计算 */
 };
 
 /* Host 私有的单 vCPU 追踪状态，仅 worker 线程读写 */
@@ -54,11 +54,6 @@ struct pvsched_entry {
 	/* ioctl INIT 时传入，worker 线程用于限定循环范围 */
 	u32 vcpu_num;
 
-	/* worker 线程与定时器，仅在 ACTIVE 状态下运行 */
-	struct task_struct *worker_thread;
-	struct hrtimer timer;
-	ktime_t interval;
-
 	/*
 	 * vcpu_states: 随 entry kzalloc 一并清零，大小固定为
 	 * PVSCHED_MAX_VCPU，仅 worker 线程读写，无需额外同步。
@@ -66,12 +61,20 @@ struct pvsched_entry {
 	struct pvsched_vcpu_state vcpu_states[PVSCHED_MAX_VCPU];
 
 	struct hlist_node node;
+	struct list_head free_node;
 	struct rcu_head rcu;
+};
+
+struct pvsched_host_runtime {
+	struct task_struct *worker_thread;
+	struct hrtimer timer;
+	ktime_t interval;
 };
 
 /* 全局哈希表：RCU 保护读端，mutex 保护写端（insert/delete） */
 static DEFINE_HASHTABLE(pvsched_htable, 8);
 static DEFINE_MUTEX(pvsched_lock);
+static struct pvsched_host_runtime pvsched_rt;
 
 /* -------------------------------------------------------------------------
  * 内部辅助：按 tgid 查找 entry
@@ -125,49 +128,92 @@ static const struct btf_kfunc_id_set pvsched_kfunc_set = {
 };
 
 /* -------------------------------------------------------------------------
- * 核心配额计算逻辑（仅 worker 线程调用）
+ * 核心配额计算逻辑（全局 worker 线程调用）
  * ---------------------------------------------------------------------- */
 
-static void pvsched_recalc_logic(struct pvsched_entry *entry)
+static u64 pvsched_collect_total_pressure(void)
 {
-	struct pvsched_shared_mem *shm = entry->kvirt_ptr;
-	struct pvsched_vcpu_state *states = entry->vcpu_states;
-	u32 vcpu_num = entry->vcpu_num;
+	struct pvsched_entry *entry;
+	unsigned int bkt;
 	u64 total_pressure = 0;
 
-	/* 1. 采集阶段 */
-	for (u32 i = 0; i < vcpu_num; i++) {
-		struct pvsched_info *info = &shm->info[i];
-		u64 cur_seq = atomic64_read(&info->update_seq);
-		u64 cur_pressure = atomic64_read(&info->qos_pressure);
+	hash_for_each_rcu(pvsched_htable, bkt, entry, node) {
+		struct pvsched_shared_mem *shm;
+		struct pvsched_vcpu_state *states;
+		u32 vcpu_num, i;
 
-		if (cur_seq != states[i].last_seq) {
-			/* Guest 推送了新数据，直接采用 */
-			states[i].cached_pressure = cur_pressure;
-			states[i].last_seq = cur_seq;
-		} else {
-			/*
-			 * Guest 没有更新 seq，执行缓慢衰减（每 tick 衰减 1/16），
-			 * 防止已崩溃或静默的 Guest 持续占用高配额。
-			 */
-			states[i].cached_pressure =
-				(states[i].cached_pressure * 15) >> 4;
+		if (READ_ONCE(entry->state) != PVSCHED_STATE_ACTIVE)
+			continue;
+
+		vcpu_num = READ_ONCE(entry->vcpu_num);
+		if (!vcpu_num || vcpu_num > PVSCHED_MAX_VCPU)
+			continue;
+
+		shm = entry->kvirt_ptr;
+		states = entry->vcpu_states;
+
+		for (i = 0; i < vcpu_num; i++) {
+			struct pvsched_info *info = &shm->info[i];
+			u64 cur_seq = atomic64_read(&info->update_seq);
+			u64 cur_pressure = atomic64_read(&info->qos_pressure);
+
+			if (cur_seq != states[i].last_seq) {
+				states[i].cached_pressure = cur_pressure;
+				states[i].last_seq = cur_seq;
+			} else {
+				states[i].cached_pressure =
+					(states[i].cached_pressure * 15) >> 4;
+			}
+
+			total_pressure += states[i].cached_pressure;
 		}
-
-		total_pressure += states[i].cached_pressure;
 	}
 
-	/* 2. 计算与分发阶段 */
-	if (total_pressure == 0)
-		total_pressure = 1; /* 避免除零 */
+	return total_pressure;
+}
 
-	u64 total_budget = 100000000ULL; /* 总预算 100 ms（单位 ns） */
+static void pvsched_distribute_budget(u64 total_pressure)
+{
+	struct pvsched_entry *entry;
+	unsigned int bkt;
+	u64 total_budget;
 
-	for (u32 i = 0; i < vcpu_num; i++) {
-		u64 budget = (states[i].cached_pressure * total_budget) /
-			     total_pressure;
-		atomic64_set(&shm->info[i].tokens, budget);
+	if (!total_pressure)
+		total_pressure = 1;
+
+	total_budget = (u64)num_online_cpus() * ktime_to_ns(pvsched_rt.interval);
+
+	hash_for_each_rcu(pvsched_htable, bkt, entry, node) {
+		struct pvsched_shared_mem *shm;
+		struct pvsched_vcpu_state *states;
+		u32 vcpu_num, i;
+
+		if (READ_ONCE(entry->state) != PVSCHED_STATE_ACTIVE)
+			continue;
+
+		vcpu_num = READ_ONCE(entry->vcpu_num);
+		if (!vcpu_num || vcpu_num > PVSCHED_MAX_VCPU)
+			continue;
+
+		shm = entry->kvirt_ptr;
+		states = entry->vcpu_states;
+
+		for (i = 0; i < vcpu_num; i++) {
+			u64 budget = (states[i].cached_pressure * total_budget) /
+				     total_pressure;
+			atomic64_set(&shm->info[i].tokens, budget);
+		}
 	}
+}
+
+static void pvsched_recalc_all_vms(void)
+{
+	u64 total_pressure;
+
+	rcu_read_lock();
+	total_pressure = pvsched_collect_total_pressure();
+	pvsched_distribute_budget(total_pressure);
+	rcu_read_unlock();
 }
 
 /* -------------------------------------------------------------------------
@@ -176,11 +222,8 @@ static void pvsched_recalc_logic(struct pvsched_entry *entry)
 
 static enum hrtimer_restart pvsched_timer_callback(struct hrtimer *timer)
 {
-	struct pvsched_entry *entry =
-		container_of(timer, struct pvsched_entry, timer);
-
-	wake_up_process(entry->worker_thread);
-	hrtimer_forward_now(timer, entry->interval);
+	wake_up_process(pvsched_rt.worker_thread);
+	hrtimer_forward_now(timer, pvsched_rt.interval);
 	return HRTIMER_RESTART;
 }
 
@@ -190,10 +233,7 @@ static enum hrtimer_restart pvsched_timer_callback(struct hrtimer *timer)
 
 static int pvsched_worker_fn(void *data)
 {
-	struct pvsched_entry *entry = data;
-
-	pr_info("pvsched_host: worker started, tgid=%d vcpu_num=%u\n",
-		entry->tgid, entry->vcpu_num);
+	pr_info("pvsched_host: global worker started\n");
 
 	while (!kthread_should_stop()) {
 		set_current_state(TASK_INTERRUPTIBLE);
@@ -202,50 +242,42 @@ static int pvsched_worker_fn(void *data)
 		if (kthread_should_stop())
 			break;
 
-		pvsched_recalc_logic(entry);
+		pvsched_recalc_all_vms();
 	}
 
 	__set_current_state(TASK_RUNNING);
-	pr_info("pvsched_host: worker exiting, tgid=%d\n", entry->tgid);
+	pr_info("pvsched_host: global worker exiting\n");
 	return 0;
 }
 
 /* -------------------------------------------------------------------------
- * ioctl 辅助：启停 timer 和 worker（spinlock 外调用，操作可能阻塞）
+ * 运行时启停：模块生命周期绑定的单 worker/single hrtimer
  * ---------------------------------------------------------------------- */
 
-static int pvsched_do_init(struct pvsched_entry *entry, u32 vcpu_num,
-			   u64 interval_ns)
+static int pvsched_runtime_start(void)
 {
-	if (vcpu_num == 0 || vcpu_num > PVSCHED_MAX_VCPU)
-		return -EINVAL;
-
-	if (interval_ns == 0)
-		return -EINVAL;
-
-	entry->vcpu_num = vcpu_num;
-	entry->interval = ns_to_ktime(interval_ns);
-
-	entry->worker_thread = kthread_run(pvsched_worker_fn, entry,
-					   "pvsched/%d", entry->tgid);
-	if (IS_ERR(entry->worker_thread)) {
-		int ret = PTR_ERR(entry->worker_thread);
-		entry->worker_thread = NULL;
+	pvsched_rt.worker_thread = kthread_run(pvsched_worker_fn, NULL,
+					       "pvsched/host");
+	if (IS_ERR(pvsched_rt.worker_thread)) {
+		int ret = PTR_ERR(pvsched_rt.worker_thread);
+		pvsched_rt.worker_thread = NULL;
 		return ret;
 	}
 
-	hrtimer_start(&entry->timer, entry->interval, HRTIMER_MODE_REL);
+	pvsched_rt.interval = ns_to_ktime(PVSCHED_DEFAULT_INTERVAL_NS);
+	hrtimer_init(&pvsched_rt.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	pvsched_rt.timer.function = pvsched_timer_callback;
+	hrtimer_start(&pvsched_rt.timer, pvsched_rt.interval, HRTIMER_MODE_REL);
 	return 0;
 }
 
-static void pvsched_do_stop(struct pvsched_entry *entry)
+static void pvsched_runtime_stop(void)
 {
-	/* hrtimer_cancel 和 kthread_stop 对已停止的对象均安全（幂等） */
-	hrtimer_cancel(&entry->timer);
+	hrtimer_cancel(&pvsched_rt.timer);
 
-	if (entry->worker_thread) {
-		kthread_stop(entry->worker_thread);
-		entry->worker_thread = NULL;
+	if (pvsched_rt.worker_thread) {
+		kthread_stop(pvsched_rt.worker_thread);
+		pvsched_rt.worker_thread = NULL;
 	}
 }
 
@@ -275,11 +307,11 @@ static int pvsched_open(struct inode *inode, struct file *file)
 	entry->tgid = curr_tgid;
 	entry->state = PVSCHED_STATE_IDLE;
 	spin_lock_init(&entry->lock);
+	INIT_LIST_HEAD(&entry->free_node);
 	/* vcpu_states 随 kzalloc 清零；vcpu_num 由 PVSCHED_INIT 写入 */
 
-	hrtimer_init(&entry->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	entry->timer.function = pvsched_timer_callback;
-	/* interval 由 PVSCHED_INIT 的 interval_ns 参数决定，此处不预设 */
+	memset(entry->kvirt_ptr, 0, PAGE_SIZE);
+	entry->kvirt_ptr->tgid = curr_tgid;
 
 	/* 全局发布：检查重复后加入哈希表 */
 	mutex_lock(&pvsched_lock);
@@ -324,18 +356,12 @@ static int pvsched_release(struct inode *inode, struct file *file)
 		return 0;
 
 	/*
-	 * 第二步：锁外停止 timer 和 worker。
-	 * 若 PVSCHED_EXIT 已先行执行，pvsched_do_stop 的幂等性保证安全。
-	 */
-	pvsched_do_stop(entry);
-
-	/*
-	 * 第三步：等待所有 RCU 读端（bpf_pvsched_get_ptr）退出临界区，
+	 * 第二步：等待所有 RCU 读端（bpf_pvsched_get_ptr / worker）退出临界区，
 	 * 之后方可安全释放 entry 内存。
 	 */
 	synchronize_rcu();
 
-	/* 第四步：释放资源 */
+	/* 第三步：释放资源 */
 	put_page(entry->page);
 	kfree(entry);
 	return 0;
@@ -359,44 +385,52 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 	switch (cmd) {
 	case PVSCHED_INIT: {
 		struct pvsched_init_args uargs;
+		struct pvsched_shared_mem *shm;
+		u32 i;
 
 		if (copy_from_user(&uargs, (void __user *)arg, sizeof(uargs)))
 			return -EFAULT;
+		if (!uargs.vcpu_num || uargs.vcpu_num > PVSCHED_MAX_VCPU)
+			return -EINVAL;
+		if (!uargs.interval_ns)
+			return -EINVAL;
 
 		spin_lock_irqsave(&entry->lock, flags);
 		if (entry->state != PVSCHED_STATE_IDLE) {
 			spin_unlock_irqrestore(&entry->lock, flags);
 			return -EBUSY;
 		}
-		/*
-		 * 先将状态置为 ACTIVE，再在 spinlock 外执行可能阻塞的
-		 * kthread_run / hrtimer_start。若 pvsched_do_init 失败，
-		 * 回滚状态至 IDLE。
-		 */
+		entry->vcpu_num = uargs.vcpu_num;
 		entry->state = PVSCHED_STATE_ACTIVE;
 		spin_unlock_irqrestore(&entry->lock, flags);
 
-		ret = pvsched_do_init(entry, uargs.vcpu_num, uargs.interval_ns);
-		if (ret) {
-			spin_lock_irqsave(&entry->lock, flags);
-			entry->state = PVSCHED_STATE_IDLE;
-			spin_unlock_irqrestore(&entry->lock, flags);
-		}
+		shm = entry->kvirt_ptr;
+		shm->vcpu_num = uargs.vcpu_num;
+		for (i = 0; i < uargs.vcpu_num; i++)
+			atomic64_set(&shm->info[i].tokens, 0);
 		break;
 	}
 
 	case PVSCHED_EXIT:
+	{
+		struct pvsched_shared_mem *shm;
+		u32 vcpu_num, i;
+
 		spin_lock_irqsave(&entry->lock, flags);
 		if (entry->state != PVSCHED_STATE_ACTIVE) {
 			spin_unlock_irqrestore(&entry->lock, flags);
 			return -EINVAL;
 		}
-		entry->state = PVSCHED_STATE_STOPPED;
+		vcpu_num = entry->vcpu_num;
+		entry->vcpu_num = 0;
+		entry->state = PVSCHED_STATE_IDLE;
 		spin_unlock_irqrestore(&entry->lock, flags);
 
-		/* spinlock 外执行可能阻塞的停止操作 */
-		pvsched_do_stop(entry);
+		shm = entry->kvirt_ptr;
+		for (i = 0; i < vcpu_num; i++)
+			atomic64_set(&shm->info[i].tokens, 0);
 		break;
+	}
 
 	default:
 		ret = -ENOTTY;
@@ -432,17 +466,40 @@ static int __init pvsched_init(void)
 	ret = misc_register(&pvsched_misc);
 	if (ret)
 		pr_err("pvsched_host: misc_register failed: %d\n", ret);
+	else {
+		ret = pvsched_runtime_start();
+		if (ret) {
+			pr_err("pvsched_host: runtime start failed: %d\n", ret);
+			misc_deregister(&pvsched_misc);
+		}
+	}
 
 	return ret;
 }
 
 static void __exit pvsched_exit(void)
 {
+	struct pvsched_entry *entry, *n;
+	struct hlist_node *tmp;
+	LIST_HEAD(free_list);
+	int bkt;
+
+	pvsched_runtime_stop();
 	misc_deregister(&pvsched_misc);
-	/*
-	 * 生产环境中此处应遍历哈希表，对所有残留 entry 执行与
-	 * pvsched_release 相同的四步清理，确保模块卸载时不泄漏资源。
-	 */
+
+	mutex_lock(&pvsched_lock);
+	hash_for_each_safe(pvsched_htable, bkt, tmp, entry, node) {
+		hash_del_rcu(&entry->node);
+		list_add(&entry->free_node, &free_list);
+	}
+	mutex_unlock(&pvsched_lock);
+
+	synchronize_rcu();
+
+	list_for_each_entry_safe(entry, n, &free_list, free_node) {
+		put_page(entry->page);
+		kfree(entry);
+	}
 }
 
 module_init(pvsched_init);
