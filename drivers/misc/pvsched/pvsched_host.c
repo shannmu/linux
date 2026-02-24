@@ -18,6 +18,7 @@
 
 #define PVSCHED_START_ADDR 0x10000000000UL
 #define PVSCHED_DEFAULT_INTERVAL_NS 100000000ULL
+#define PVSCHED_MIN_BUDGET_PCT 1
 
 /* ioctl 命令定义（同步写入 pvsched.h 供用户态使用）
  *
@@ -177,11 +178,39 @@ static void pvsched_distribute_budget(u64 total_pressure)
 	struct pvsched_entry *entry;
 	unsigned int bkt;
 	u64 total_budget;
-
-	if (!total_pressure)
-		total_pressure = 1;
+	u64 min_budget;
+	u64 min_total_budget;
+	u64 remaining_budget;
+	u32 total_vcpus = 0;
 
 	total_budget = (u64)num_online_cpus() * ktime_to_ns(pvsched_rt.interval);
+	min_budget = ktime_to_ns(pvsched_rt.interval) * PVSCHED_MIN_BUDGET_PCT / 100;
+	if (!min_budget)
+		min_budget = 1;
+
+	hash_for_each_rcu(pvsched_htable, bkt, entry, node) {
+		u32 vcpu_num;
+
+		if (READ_ONCE(entry->state) != PVSCHED_STATE_ACTIVE)
+			continue;
+
+		vcpu_num = READ_ONCE(entry->vcpu_num);
+		if (!vcpu_num || vcpu_num > PVSCHED_MAX_VCPU)
+			continue;
+
+		total_vcpus += vcpu_num;
+	}
+
+	if (!total_vcpus)
+		return;
+
+	min_total_budget = min_budget * total_vcpus;
+	if (min_total_budget > total_budget) {
+		min_budget = total_budget / total_vcpus;
+		min_total_budget = min_budget * total_vcpus;
+	}
+
+	remaining_budget = total_budget - min_total_budget;
 
 	hash_for_each_rcu(pvsched_htable, bkt, entry, node) {
 		struct pvsched_shared_mem *shm;
@@ -199,8 +228,16 @@ static void pvsched_distribute_budget(u64 total_pressure)
 		states = entry->vcpu_states;
 
 		for (i = 0; i < vcpu_num; i++) {
-			u64 budget = (states[i].cached_pressure * total_budget) /
-				     total_pressure;
+			u64 budget = min_budget;
+
+			if (remaining_budget) {
+				if (total_pressure)
+					budget += (states[i].cached_pressure *
+						   remaining_budget) /
+						  total_pressure;
+				else
+					budget += remaining_budget / total_vcpus;
+			}
 			atomic64_set(&shm->info[i].tokens, budget);
 		}
 	}
