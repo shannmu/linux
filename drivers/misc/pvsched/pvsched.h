@@ -34,6 +34,7 @@ struct pvsched_init_args {
 	uint32_t vcpu_num;
 	uint32_t _pad;
 	uint64_t interval_ns;
+	uint64_t shm_hva;   /* QEMU 侧共享内存的 HVA，由 QEMU 填入 */
 };
 
 #define PVSCHED_INIT _IOW(PVSCHED_MAGIC, 0, struct pvsched_init_args)

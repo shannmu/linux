@@ -13,10 +13,11 @@
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/cpu.h>
+#include <linux/vmalloc.h>
 
 #include "pvsched.h"
 
-#define PVSCHED_START_ADDR 0x10000000000UL
+#define PVSCHED_START_ADDR 0x10000100000UL
 #define PVSCHED_DEFAULT_INTERVAL_NS 100000000ULL
 #define PVSCHED_MIN_BUDGET_PCT 1
 
@@ -183,6 +184,7 @@ static void pvsched_distribute_budget(u64 total_pressure)
 	u64 remaining_budget;
 	u32 total_vcpus = 0;
 
+	// FIXME: use ioslate cpus instead of online cpus
 	total_budget = (u64)num_online_cpus() * ktime_to_ns(pvsched_rt.interval);
 	min_budget = ktime_to_ns(pvsched_rt.interval) * PVSCHED_MIN_BUDGET_PCT / 100;
 	if (!min_budget)
@@ -332,42 +334,46 @@ static int pvsched_open(struct inode *inode, struct file *file)
 	if (!entry)
 		return -ENOMEM;
 
-	/* Pin 单页：整个共享内存结构固定在一个 4KB 页内 */
-	ret = get_user_pages_fast(PVSCHED_START_ADDR, 1, FOLL_WRITE,
-				  &entry->page);
-	if (ret != 1) {
-		ret = -EFAULT;
-		goto err_free_entry;
-	}
-
-	entry->kvirt_ptr = page_address(entry->page);
+	// /* Pin 单页：整个共享内存结构固定在一个 4KB 页内 */
+	// ret = get_user_pages_fast(PVSCHED_START_ADDR, 1, FOLL_WRITE,
+	// 			  &entry->page);
+	// if (ret != 1) {
+	// 	ret = -EFAULT;
+	// 	goto err_free_entry;
+	// }
+	//
+	// entry->kvirt_ptr = page_address(entry->page);
 	entry->tgid = curr_tgid;
 	entry->state = PVSCHED_STATE_IDLE;
 	spin_lock_init(&entry->lock);
 	INIT_LIST_HEAD(&entry->free_node);
 	/* vcpu_states 随 kzalloc 清零；vcpu_num 由 PVSCHED_INIT 写入 */
 
-	memset(entry->kvirt_ptr, 0, PAGE_SIZE);
-	entry->kvirt_ptr->tgid = curr_tgid;
+	// memset(entry->kvirt_ptr, 0, PAGE_SIZE);
+	// entry->kvirt_ptr->tgid = curr_tgid;
 
 	/* 全局发布：检查重复后加入哈希表 */
 	mutex_lock(&pvsched_lock);
-
 	if (pvsched_find_locked(curr_tgid)) {
 		ret = -EBUSY;
 		mutex_unlock(&pvsched_lock);
-		goto err_put_page;
+		goto err_free;
 	}
 
 	hash_add_rcu(pvsched_htable, &entry->node, entry->tgid);
 	mutex_unlock(&pvsched_lock);
 
+	file->private_data = entry;
+
 	return 0;
 
-err_put_page:
-	put_page(entry->page);
-err_free_entry:
+err_free:
 	kfree(entry);
+
+// err_put_page:
+// 	put_page(entry->page);
+// err_free_entry:
+// 	kfree(entry);
 	return ret;
 }
 
@@ -399,7 +405,10 @@ static int pvsched_release(struct inode *inode, struct file *file)
 	synchronize_rcu();
 
 	/* 第三步：释放资源 */
-	put_page(entry->page);
+	if (entry->kvirt_ptr)
+		vunmap(entry->kvirt_ptr);
+	if (entry->page)       /* INIT 后未 EXIT 直接关闭 */
+		put_page(entry->page);
 	kfree(entry);
 	return 0;
 }
@@ -423,7 +432,11 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 	case PVSCHED_INIT: {
 		struct pvsched_init_args uargs;
 		struct pvsched_shared_mem *shm;
+		struct page *page = NULL;
+		void *kvirt;
+		int pin_ret;
 		u32 i;
+
 
 		if (copy_from_user(&uargs, (void __user *)arg, sizeof(uargs)))
 			return -EFAULT;
@@ -431,17 +444,36 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 			return -EINVAL;
 		if (!uargs.interval_ns)
 			return -EINVAL;
+		if (!uargs.shm_hva || !PAGE_ALIGNED(uargs.shm_hva))
+			return -EINVAL;
 
+		/* pin QEMU 的 HVA 对应的页 */
+		pin_ret = get_user_pages_fast(uargs.shm_hva, 1, FOLL_WRITE, &page);
+		if (pin_ret != 1)
+			return -EFAULT;
+
+		kvirt = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
+		if (!kvirt) {
+			put_page(page);
+			return -ENOMEM;
+		}
 		spin_lock_irqsave(&entry->lock, flags);
 		if (entry->state != PVSCHED_STATE_IDLE) {
 			spin_unlock_irqrestore(&entry->lock, flags);
+			vunmap(kvirt);
+			put_page(page);
 			return -EBUSY;
 		}
+		entry->page = page;
+		entry->kvirt_ptr = kvirt;
 		entry->vcpu_num = uargs.vcpu_num;
 		entry->state = PVSCHED_STATE_ACTIVE;
 		spin_unlock_irqrestore(&entry->lock, flags);
 
 		shm = entry->kvirt_ptr;
+		memset(shm, 0, PAGE_SIZE);
+		// FIXME: atomic opeation
+		shm->tgid     = entry->tgid;
 		shm->vcpu_num = uargs.vcpu_num;
 		for (i = 0; i < uargs.vcpu_num; i++)
 			atomic64_set(&shm->info[i].tokens, 0);
@@ -450,7 +482,8 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 
 	case PVSCHED_EXIT:
 	{
-		struct pvsched_shared_mem *shm;
+		struct page *old_page;
+				struct pvsched_shared_mem *shm;
 		u32 vcpu_num, i;
 
 		spin_lock_irqsave(&entry->lock, flags);
@@ -459,13 +492,22 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 			return -EINVAL;
 		}
 		vcpu_num = entry->vcpu_num;
+		old_page = entry->page;
+		shm = entry->kvirt_ptr;
 		entry->vcpu_num = 0;
 		entry->state = PVSCHED_STATE_IDLE;
+		entry->page = NULL;
+		entry->kvirt_ptr = NULL;
 		spin_unlock_irqrestore(&entry->lock, flags);
+		
+		/* 等待 worker 退出当前 RCU 临界区，确保不再访问 shm */
+		synchronize_rcu();
 
-		shm = entry->kvirt_ptr;
 		for (i = 0; i < vcpu_num; i++)
 			atomic64_set(&shm->info[i].tokens, 0);
+
+		vunmap(shm);
+		put_page(old_page);
 		break;
 	}
 
@@ -534,7 +576,10 @@ static void __exit pvsched_exit(void)
 	synchronize_rcu();
 
 	list_for_each_entry_safe(entry, n, &free_list, free_node) {
-		put_page(entry->page);
+		if (entry->kvirt_ptr)
+			vunmap(entry->kvirt_ptr);
+		if (entry->page)
+			put_page(entry->page);
 		kfree(entry);
 	}
 }
