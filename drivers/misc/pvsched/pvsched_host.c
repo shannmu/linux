@@ -1,3 +1,5 @@
+#define pr_fmt(fmt) "pvsched_host: " fmt
+
 #include "linux/bpf.h"
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -14,6 +16,8 @@
 #include <linux/btf_ids.h>
 #include <linux/cpu.h>
 #include <linux/vmalloc.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 #include "pvsched.h"
 
@@ -77,6 +81,9 @@ struct pvsched_host_runtime {
 static DEFINE_HASHTABLE(pvsched_htable, 8);
 static DEFINE_MUTEX(pvsched_lock);
 static struct pvsched_host_runtime pvsched_rt;
+
+/* /proc/pvsched_host 目录 */
+static struct proc_dir_entry *pvsched_proc_dir;
 
 /* -------------------------------------------------------------------------
  * 内部辅助：按 tgid 查找 entry
@@ -256,6 +263,126 @@ static void pvsched_recalc_all_vms(void)
 }
 
 /* -------------------------------------------------------------------------
+ * /proc/pvsched_host/status — 全局运行时信息
+ * ---------------------------------------------------------------------- */
+
+static int pvsched_proc_status_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "online_cpus:  %u\n", num_online_cpus());
+	seq_printf(m, "interval_ns:  %llu\n", ktime_to_ns(pvsched_rt.interval));
+	seq_printf(m, "worker_alive: %d\n",
+		   pvsched_rt.worker_thread != NULL ? 1 : 0);
+	return 0;
+}
+
+static int pvsched_proc_status_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, pvsched_proc_status_show, NULL);
+}
+
+static const struct proc_ops pvsched_proc_status_ops = {
+	.proc_open    = pvsched_proc_status_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+/* -------------------------------------------------------------------------
+ * /proc/pvsched_host/vms — 每个 VM 的摘要（每行一个 VM）
+ * ---------------------------------------------------------------------- */
+
+static int pvsched_proc_vms_show(struct seq_file *m, void *v)
+{
+	struct pvsched_entry *entry;
+	unsigned int bkt;
+
+	seq_printf(m, "%-10s %-8s %s\n", "tgid", "state", "vcpu_num");
+	seq_puts(m, "-----------------------------\n");
+
+	rcu_read_lock();
+	hash_for_each_rcu(pvsched_htable, bkt, entry, node) {
+		enum pvsched_state state = READ_ONCE(entry->state);
+
+		seq_printf(m, "%-10d %-8s %u\n",
+			   entry->tgid,
+			   state == PVSCHED_STATE_ACTIVE ? "ACTIVE" : "IDLE",
+			   READ_ONCE(entry->vcpu_num));
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int pvsched_proc_vms_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, pvsched_proc_vms_show, NULL);
+}
+
+static const struct proc_ops pvsched_proc_vms_ops = {
+	.proc_open    = pvsched_proc_vms_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+/* -------------------------------------------------------------------------
+ * /proc/pvsched_host/vcpus — 每个 vCPU 的调度数据（每行一个 vCPU）
+ * ---------------------------------------------------------------------- */
+
+static int pvsched_proc_vcpus_show(struct seq_file *m, void *v)
+{
+	struct pvsched_entry *entry;
+	unsigned int bkt;
+
+	seq_printf(m, "%-10s %-8s %-16s %-16s %-16s %-16s\n",
+		   "tgid", "vcpu_id", "qos_pressure", "cached_pressure",
+		   "update_seq", "tokens");
+	seq_puts(m, "----------------------------------------------------------------------"
+		    "----------\n");
+
+	rcu_read_lock();
+	hash_for_each_rcu(pvsched_htable, bkt, entry, node) {
+		struct pvsched_shared_mem *shm;
+		u32 vcpu_num, i;
+
+		if (READ_ONCE(entry->state) != PVSCHED_STATE_ACTIVE)
+			continue;
+
+		vcpu_num = READ_ONCE(entry->vcpu_num);
+		if (!vcpu_num || vcpu_num > PVSCHED_MAX_VCPU)
+			continue;
+
+		shm = entry->kvirt_ptr;
+
+		for (i = 0; i < vcpu_num; i++) {
+			seq_printf(m,
+				   "%-10d %-8u %-16lld %-16llu %-16lld %-16lld\n",
+				   entry->tgid,
+				   i,
+				   atomic64_read(&shm->info[i].qos_pressure),
+				   entry->vcpu_states[i].cached_pressure,
+				   atomic64_read(&shm->info[i].update_seq),
+				   atomic64_read(&shm->info[i].tokens));
+		}
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int pvsched_proc_vcpus_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, pvsched_proc_vcpus_show, NULL);
+}
+
+static const struct proc_ops pvsched_proc_vcpus_ops = {
+	.proc_open    = pvsched_proc_vcpus_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+/* -------------------------------------------------------------------------
  * 定时器回调：中断上下文，仅唤醒 worker 线程
  * ---------------------------------------------------------------------- */
 
@@ -272,7 +399,7 @@ static enum hrtimer_restart pvsched_timer_callback(struct hrtimer *timer)
 
 static int pvsched_worker_fn(void *data)
 {
-	pr_info("pvsched_host: global worker started\n");
+	pr_info("global worker started\n");
 
 	while (!kthread_should_stop()) {
 		set_current_state(TASK_INTERRUPTIBLE);
@@ -285,7 +412,7 @@ static int pvsched_worker_fn(void *data)
 	}
 
 	__set_current_state(TASK_RUNNING);
-	pr_info("pvsched_host: global worker exiting\n");
+	pr_info("global worker exiting\n");
 	return 0;
 }
 
@@ -299,7 +426,9 @@ static int pvsched_runtime_start(void)
 					       "pvsched/host");
 	if (IS_ERR(pvsched_rt.worker_thread)) {
 		int ret = PTR_ERR(pvsched_rt.worker_thread);
+
 		pvsched_rt.worker_thread = NULL;
+		pr_err("failed to create worker thread: %d\n", ret);
 		return ret;
 	}
 
@@ -307,6 +436,9 @@ static int pvsched_runtime_start(void)
 	hrtimer_init(&pvsched_rt.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	pvsched_rt.timer.function = pvsched_timer_callback;
 	hrtimer_start(&pvsched_rt.timer, pvsched_rt.interval, HRTIMER_MODE_REL);
+
+	pr_info("runtime started, interval_ns=%llu\n",
+		PVSCHED_DEFAULT_INTERVAL_NS);
 	return 0;
 }
 
@@ -318,6 +450,8 @@ static void pvsched_runtime_stop(void)
 		kthread_stop(pvsched_rt.worker_thread);
 		pvsched_rt.worker_thread = NULL;
 	}
+
+	pr_info("runtime stopped\n");
 }
 
 /* -------------------------------------------------------------------------
@@ -330,31 +464,26 @@ static int pvsched_open(struct inode *inode, struct file *file)
 	struct pvsched_entry *entry;
 	int ret;
 
-	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-	if (!entry)
-		return -ENOMEM;
+	pr_info("open: tgid=%d\n", curr_tgid);
 
-	// /* Pin 单页：整个共享内存结构固定在一个 4KB 页内 */
-	// ret = get_user_pages_fast(PVSCHED_START_ADDR, 1, FOLL_WRITE,
-	// 			  &entry->page);
-	// if (ret != 1) {
-	// 	ret = -EFAULT;
-	// 	goto err_free_entry;
-	// }
-	//
-	// entry->kvirt_ptr = page_address(entry->page);
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		pr_warn_ratelimited("open: tgid=%d alloc entry failed\n",
+				    curr_tgid);
+		return -ENOMEM;
+	}
+
 	entry->tgid = curr_tgid;
 	entry->state = PVSCHED_STATE_IDLE;
 	spin_lock_init(&entry->lock);
 	INIT_LIST_HEAD(&entry->free_node);
 	/* vcpu_states 随 kzalloc 清零；vcpu_num 由 PVSCHED_INIT 写入 */
 
-	// memset(entry->kvirt_ptr, 0, PAGE_SIZE);
-	// entry->kvirt_ptr->tgid = curr_tgid;
-
 	/* 全局发布：检查重复后加入哈希表 */
 	mutex_lock(&pvsched_lock);
 	if (pvsched_find_locked(curr_tgid)) {
+		pr_warn_ratelimited("open: tgid=%d already registered\n",
+				    curr_tgid);
 		ret = -EBUSY;
 		mutex_unlock(&pvsched_lock);
 		goto err_free;
@@ -365,15 +494,11 @@ static int pvsched_open(struct inode *inode, struct file *file)
 
 	file->private_data = entry;
 
+	pr_info("open: tgid=%d registered\n", curr_tgid);
 	return 0;
 
 err_free:
 	kfree(entry);
-
-// err_put_page:
-// 	put_page(entry->page);
-// err_free_entry:
-// 	kfree(entry);
 	return ret;
 }
 
@@ -383,6 +508,8 @@ static int pvsched_release(struct inode *inode, struct file *file)
 	struct pvsched_entry *entry = NULL;
 	struct pvsched_entry *pos;
 	struct hlist_node *tmp;
+
+	pr_info("release: tgid=%d\n", curr_tgid);
 
 	/* 第一步：锁内摘表，不执行任何可能阻塞的操作 */
 	mutex_lock(&pvsched_lock);
@@ -395,8 +522,11 @@ static int pvsched_release(struct inode *inode, struct file *file)
 	}
 	mutex_unlock(&pvsched_lock);
 
-	if (!entry)
+	if (!entry) {
+		pr_warn_ratelimited("release: tgid=%d not found in table\n",
+				    curr_tgid);
 		return 0;
+	}
 
 	/*
 	 * 第二步：等待所有 RCU 读端（bpf_pvsched_get_ptr / worker）退出临界区，
@@ -410,6 +540,8 @@ static int pvsched_release(struct inode *inode, struct file *file)
 	if (entry->page)       /* INIT 后未 EXIT 直接关闭 */
 		put_page(entry->page);
 	kfree(entry);
+
+	pr_info("release: tgid=%d unregistered\n", curr_tgid);
 	return 0;
 }
 
@@ -425,8 +557,11 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 	entry = pvsched_find_rcu(curr_tgid);
 	rcu_read_unlock();
 
-	if (!entry)
+	if (!entry) {
+		pr_warn_ratelimited("ioctl: tgid=%d not found, cmd=%u\n",
+				    curr_tgid, cmd);
 		return -ENOENT;
+	}
 
 	switch (cmd) {
 	case PVSCHED_INIT: {
@@ -437,31 +572,51 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 		int pin_ret;
 		u32 i;
 
-
 		if (copy_from_user(&uargs, (void __user *)arg, sizeof(uargs)))
 			return -EFAULT;
-		if (!uargs.vcpu_num || uargs.vcpu_num > PVSCHED_MAX_VCPU)
+		if (!uargs.vcpu_num || uargs.vcpu_num > PVSCHED_MAX_VCPU) {
+			pr_warn_ratelimited("ioctl INIT: tgid=%d invalid vcpu_num=%u\n",
+					    curr_tgid, uargs.vcpu_num);
 			return -EINVAL;
-		if (!uargs.interval_ns)
+		}
+		if (!uargs.interval_ns) {
+			pr_warn_ratelimited("ioctl INIT: tgid=%d zero interval_ns\n",
+					    curr_tgid);
 			return -EINVAL;
-		if (!uargs.shm_hva || !PAGE_ALIGNED(uargs.shm_hva))
+		}
+		if (!uargs.shm_hva || !PAGE_ALIGNED(uargs.shm_hva)) {
+			pr_warn_ratelimited("ioctl INIT: tgid=%d invalid shm_hva=0x%llx\n",
+					    curr_tgid, uargs.shm_hva);
 			return -EINVAL;
+		}
+
+		pr_info("ioctl INIT: tgid=%d vcpu_num=%u interval_ns=%llu shm_hva=0x%llx\n",
+			 curr_tgid, uargs.vcpu_num, uargs.interval_ns,
+			 uargs.shm_hva);
 
 		/* pin QEMU 的 HVA 对应的页 */
 		pin_ret = get_user_pages_fast(uargs.shm_hva, 1, FOLL_WRITE, &page);
-		if (pin_ret != 1)
+		if (pin_ret != 1) {
+			pr_warn_ratelimited("ioctl INIT: tgid=%d pin shm page failed\n",
+					    curr_tgid);
 			return -EFAULT;
+		}
 
 		kvirt = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
 		if (!kvirt) {
 			put_page(page);
+			pr_warn_ratelimited("ioctl INIT: tgid=%d vmap failed\n",
+					    curr_tgid);
 			return -ENOMEM;
 		}
+
 		spin_lock_irqsave(&entry->lock, flags);
 		if (entry->state != PVSCHED_STATE_IDLE) {
 			spin_unlock_irqrestore(&entry->lock, flags);
 			vunmap(kvirt);
 			put_page(page);
+			pr_warn_ratelimited("ioctl INIT: tgid=%d not in IDLE state\n",
+					    curr_tgid);
 			return -EBUSY;
 		}
 		entry->page = page;
@@ -477,18 +632,23 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 		shm->vcpu_num = uargs.vcpu_num;
 		for (i = 0; i < uargs.vcpu_num; i++)
 			atomic64_set(&shm->info[i].tokens, 0);
+
+		pr_info("ioctl INIT: tgid=%d activated\n", curr_tgid);
 		break;
 	}
 
-	case PVSCHED_EXIT:
-	{
+	case PVSCHED_EXIT: {
 		struct page *old_page;
-				struct pvsched_shared_mem *shm;
+		struct pvsched_shared_mem *shm;
 		u32 vcpu_num, i;
+
+		pr_info("ioctl EXIT: tgid=%d\n", curr_tgid);
 
 		spin_lock_irqsave(&entry->lock, flags);
 		if (entry->state != PVSCHED_STATE_ACTIVE) {
 			spin_unlock_irqrestore(&entry->lock, flags);
+			pr_warn_ratelimited("ioctl EXIT: tgid=%d not in ACTIVE state\n",
+					    curr_tgid);
 			return -EINVAL;
 		}
 		vcpu_num = entry->vcpu_num;
@@ -499,7 +659,7 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 		entry->page = NULL;
 		entry->kvirt_ptr = NULL;
 		spin_unlock_irqrestore(&entry->lock, flags);
-		
+
 		/* 等待 worker 退出当前 RCU 临界区，确保不再访问 shm */
 		synchronize_rcu();
 
@@ -508,10 +668,14 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 
 		vunmap(shm);
 		put_page(old_page);
+
+		pr_info("ioctl EXIT: tgid=%d deactivated\n", curr_tgid);
 		break;
 	}
 
 	default:
+		pr_warn_ratelimited("ioctl: tgid=%d unknown cmd=%u\n",
+				    curr_tgid, cmd);
 		ret = -ENOTTY;
 	}
 
@@ -531,29 +695,58 @@ static struct miscdevice pvsched_misc = {
 	.fops = &pvsched_fops,
 };
 
+static void pvsched_proc_init(void)
+{
+	pvsched_proc_dir = proc_mkdir("pvsched_host", NULL);
+	if (!pvsched_proc_dir) {
+		pr_warn("failed to create /proc/pvsched_host\n");
+		return;
+	}
+
+	if (!proc_create("status", 0444, pvsched_proc_dir,
+			 &pvsched_proc_status_ops))
+		pr_warn("failed to create /proc/pvsched_host/status\n");
+
+	if (!proc_create("vms", 0444, pvsched_proc_dir,
+			 &pvsched_proc_vms_ops))
+		pr_warn("failed to create /proc/pvsched_host/vms\n");
+
+	if (!proc_create("vcpus", 0444, pvsched_proc_dir,
+			 &pvsched_proc_vcpus_ops))
+		pr_warn("failed to create /proc/pvsched_host/vcpus\n");
+}
+
 static int __init pvsched_init(void)
 {
 	int ret;
 
+	pr_info("module loading, interval_ns=%llu, online_cpus=%u\n",
+		PVSCHED_DEFAULT_INTERVAL_NS, num_online_cpus());
+
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
 					&pvsched_kfunc_set);
 	if (ret) {
-		pr_err("pvsched_host: register kfunc set failed: %d\n", ret);
+		pr_err("register kfunc set failed: %d\n", ret);
 		return ret;
 	}
 
 	ret = misc_register(&pvsched_misc);
-	if (ret)
-		pr_err("pvsched_host: misc_register failed: %d\n", ret);
-	else {
-		ret = pvsched_runtime_start();
-		if (ret) {
-			pr_err("pvsched_host: runtime start failed: %d\n", ret);
-			misc_deregister(&pvsched_misc);
-		}
+	if (ret) {
+		pr_err("misc_register failed: %d\n", ret);
+		return ret;
 	}
 
-	return ret;
+	ret = pvsched_runtime_start();
+	if (ret) {
+		pr_err("runtime start failed: %d\n", ret);
+		misc_deregister(&pvsched_misc);
+		return ret;
+	}
+
+	pvsched_proc_init();
+
+	pr_info("module loaded\n");
+	return 0;
 }
 
 static void __exit pvsched_exit(void)
@@ -562,6 +755,11 @@ static void __exit pvsched_exit(void)
 	struct hlist_node *tmp;
 	LIST_HEAD(free_list);
 	int bkt;
+
+	pr_info("module unloading\n");
+
+	if (pvsched_proc_dir)
+		remove_proc_subtree("pvsched_host", NULL);
 
 	pvsched_runtime_stop();
 	misc_deregister(&pvsched_misc);
@@ -582,6 +780,8 @@ static void __exit pvsched_exit(void)
 			put_page(entry->page);
 		kfree(entry);
 	}
+
+	pr_info("module unloaded\n");
 }
 
 module_init(pvsched_init);
