@@ -93,13 +93,44 @@ static struct proc_dir_entry *pvsched_proc_dir;
 /*
  * 使能开关：仅当内核命令行包含 pvsched_host=on 时才激活所有功能。
  * 未传入该参数时，模块加载/设备注册等均跳过，做到零开销。
+ *
+ * 支持的 cmdline 格式：
+ *   pvsched_host=on
+ *   pvsched_host=on,interval=<ns>,min_budget_pct=<0-100>
  */
 static bool pvsched_enabled __read_mostly;
+static u64 pvsched_interval_ns __read_mostly = PVSCHED_DEFAULT_INTERVAL_NS;
+static u32 pvsched_min_budget_pct __read_mostly = PVSCHED_MIN_BUDGET_PCT;
 
 static int __init pvsched_setup(char *str)
 {
-	if (str && strcmp(str, "on") == 0)
-		pvsched_enabled = true;
+	char *token;
+
+	if (!str)
+		return 1;
+
+	/* 第一个 token 必须是 "on" */
+	token = strsep(&str, ",");
+	if (!token || strcmp(token, "on") != 0)
+		return 1;
+
+	pvsched_enabled = true;
+
+	/* 解析可选参数 */
+	while ((token = strsep(&str, ",")) != NULL) {
+		if (strncmp(token, "interval=", 9) == 0) {
+			u64 val;
+
+			if (kstrtoull(token + 9, 10, &val) == 0 && val > 0)
+				pvsched_interval_ns = val;
+		} else if (strncmp(token, "min_budget_pct=", 15) == 0) {
+			unsigned long val;
+
+			if (kstrtoul(token + 15, 10, &val) == 0 && val <= 100)
+				pvsched_min_budget_pct = (u32)val;
+		}
+	}
+
 	return 1;
 }
 early_param("pvsched_host", pvsched_setup);
@@ -212,7 +243,7 @@ static void pvsched_distribute_budget(u64 total_pressure)
 
 	/* isolated_cpus 在模块加载时已缓存，直接读取 */
 	total_budget = (u64)pvsched_rt.isolated_cpus * ktime_to_ns(pvsched_rt.interval);
-	min_budget = ktime_to_ns(pvsched_rt.interval) * PVSCHED_MIN_BUDGET_PCT / 100;
+	min_budget = ktime_to_ns(pvsched_rt.interval) * pvsched_min_budget_pct / 100;
 	if (!min_budget)
 		min_budget = 1;
 
@@ -287,9 +318,10 @@ static void pvsched_recalc_all_vms(void)
 
 static int pvsched_proc_status_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "isolated_cpus: %u\n", pvsched_rt.isolated_cpus);
-	seq_printf(m, "interval_ns:  %llu\n", ktime_to_ns(pvsched_rt.interval));
-	seq_printf(m, "worker_alive: %d\n",
+	seq_printf(m, "isolated_cpus:   %u\n", pvsched_rt.isolated_cpus);
+	seq_printf(m, "interval_ns:     %llu\n", ktime_to_ns(pvsched_rt.interval));
+	seq_printf(m, "min_budget_pct:  %u\n", pvsched_min_budget_pct);
+	seq_printf(m, "worker_alive:    %d\n",
 		   pvsched_rt.worker_thread != NULL ? 1 : 0);
 	return 0;
 }
@@ -451,7 +483,7 @@ static int pvsched_runtime_start(void)
 		return ret;
 	}
 
-	pvsched_rt.interval = ns_to_ktime(PVSCHED_DEFAULT_INTERVAL_NS);
+	pvsched_rt.interval = ns_to_ktime(pvsched_interval_ns);
 
 	/*
 	 * 缓存隔离 CPU 数量：isolcpus= 由内核启动参数静态决定，
@@ -473,8 +505,8 @@ static int pvsched_runtime_start(void)
 	pvsched_rt.timer.function = pvsched_timer_callback;
 	hrtimer_start(&pvsched_rt.timer, pvsched_rt.interval, HRTIMER_MODE_REL);
 
-	pr_info("runtime started, interval_ns=%llu, isolated_cpus=%u\n",
-		PVSCHED_DEFAULT_INTERVAL_NS, pvsched_rt.isolated_cpus);
+	pr_info("runtime started, interval_ns=%llu, min_budget_pct=%u, isolated_cpus=%u\n",
+		pvsched_interval_ns, pvsched_min_budget_pct, pvsched_rt.isolated_cpus);
 	return 0;
 }
 
@@ -771,8 +803,8 @@ static int __init pvsched_init(void)
 		return 0;
 	}
 
-	pr_info("module loading, interval_ns=%llu, online_cpus=%u\n",
-		PVSCHED_DEFAULT_INTERVAL_NS, num_online_cpus());
+	pr_info("module loading, interval_ns=%llu, min_budget_pct=%u, online_cpus=%u\n",
+		pvsched_interval_ns, pvsched_min_budget_pct, num_online_cpus());
 
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
 					&pvsched_kfunc_set);
