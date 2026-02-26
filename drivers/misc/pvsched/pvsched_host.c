@@ -22,7 +22,6 @@
 
 #include "pvsched.h"
 
-#define PVSCHED_START_ADDR 0x10000100000UL
 #define PVSCHED_DEFAULT_INTERVAL_NS 100000000ULL
 #define PVSCHED_MIN_BUDGET_PCT 1
 
@@ -50,7 +49,7 @@ struct pvsched_vcpu_state {
 struct pvsched_entry {
 	pid_t tgid;
 
-	/* 共享内存：单虚拟机对应单页，固定在 PVSCHED_START_ADDR */
+	/* 共享内存：单虚拟机对应单页*/
 	struct pvsched_shared_mem *kvirt_ptr;
 	struct page *page;
 
