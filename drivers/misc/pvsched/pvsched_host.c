@@ -91,6 +91,20 @@ static struct pvsched_host_runtime pvsched_rt;
 /* /proc/pvsched_host 目录 */
 static struct proc_dir_entry *pvsched_proc_dir;
 
+/*
+ * 使能开关：仅当内核命令行包含 pvsched_host=on 时才激活所有功能。
+ * 未传入该参数时，模块加载/设备注册等均跳过，做到零开销。
+ */
+static bool pvsched_enabled __read_mostly;
+
+static int __init pvsched_setup(char *str)
+{
+	if (str && strcmp(str, "on") == 0)
+		pvsched_enabled = true;
+	return 1;
+}
+early_param("pvsched_host", pvsched_setup);
+
 /* -------------------------------------------------------------------------
  * 内部辅助：按 tgid 查找 entry
  * ---------------------------------------------------------------------- */
@@ -753,6 +767,11 @@ static int __init pvsched_init(void)
 {
 	int ret;
 
+	if (!pvsched_enabled) {
+		pr_info("disabled (pass 'pvsched_host=on' on the kernel cmdline to enable)\n");
+		return 0;
+	}
+
 	pr_info("module loading, interval_ns=%llu, online_cpus=%u\n",
 		PVSCHED_DEFAULT_INTERVAL_NS, num_online_cpus());
 
@@ -788,6 +807,9 @@ static void __exit pvsched_exit(void)
 	struct hlist_node *tmp;
 	LIST_HEAD(free_list);
 	int bkt;
+
+	if (!pvsched_enabled)
+		return;
 
 	pr_info("module unloading\n");
 
