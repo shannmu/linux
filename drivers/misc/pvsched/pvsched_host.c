@@ -18,6 +18,7 @@
 #include <linux/vmalloc.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/sched/isolation.h>
 
 #include "pvsched.h"
 
@@ -75,6 +76,11 @@ struct pvsched_host_runtime {
 	struct task_struct *worker_thread;
 	struct hrtimer timer;
 	ktime_t interval;
+	/*
+	 * 隔离 CPU 数量：在模块加载时由 isolcpus= 内核参数静态决定，
+	 * 缓存于此，避免在 worker 每次触发时重复遍历所有在线 CPU。
+	 */
+	u32 isolated_cpus;
 };
 
 /* 全局哈希表：RCU 保护读端，mutex 保护写端（insert/delete） */
@@ -191,8 +197,8 @@ static void pvsched_distribute_budget(u64 total_pressure)
 	u64 remaining_budget;
 	u32 total_vcpus = 0;
 
-	// FIXME: use ioslate cpus instead of online cpus
-	total_budget = (u64)num_online_cpus() * ktime_to_ns(pvsched_rt.interval);
+	/* isolated_cpus 在模块加载时已缓存，直接读取 */
+	total_budget = (u64)pvsched_rt.isolated_cpus * ktime_to_ns(pvsched_rt.interval);
 	min_budget = ktime_to_ns(pvsched_rt.interval) * PVSCHED_MIN_BUDGET_PCT / 100;
 	if (!min_budget)
 		min_budget = 1;
@@ -268,7 +274,7 @@ static void pvsched_recalc_all_vms(void)
 
 static int pvsched_proc_status_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "online_cpus:  %u\n", num_online_cpus());
+	seq_printf(m, "isolated_cpus: %u\n", pvsched_rt.isolated_cpus);
 	seq_printf(m, "interval_ns:  %llu\n", ktime_to_ns(pvsched_rt.interval));
 	seq_printf(m, "worker_alive: %d\n",
 		   pvsched_rt.worker_thread != NULL ? 1 : 0);
@@ -433,12 +439,29 @@ static int pvsched_runtime_start(void)
 	}
 
 	pvsched_rt.interval = ns_to_ktime(PVSCHED_DEFAULT_INTERVAL_NS);
+
+	/*
+	 * 缓存隔离 CPU 数量：isolcpus= 由内核启动参数静态决定，
+	 * 模块加载时计算一次即可，无需在 worker 每次触发时重复遍历。
+	 * 若未配置任何隔离 CPU，则回退到在线 CPU 总数。
+	 */
+	{
+		u32 count = 0;
+		int cpu;
+
+		for_each_online_cpu(cpu) {
+			if (!housekeeping_test_cpu(cpu, HK_TYPE_DOMAIN))
+				count++;
+		}
+		pvsched_rt.isolated_cpus = count ? count : num_online_cpus();
+	}
+
 	hrtimer_init(&pvsched_rt.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	pvsched_rt.timer.function = pvsched_timer_callback;
 	hrtimer_start(&pvsched_rt.timer, pvsched_rt.interval, HRTIMER_MODE_REL);
 
-	pr_info("runtime started, interval_ns=%llu\n",
-		PVSCHED_DEFAULT_INTERVAL_NS);
+	pr_info("runtime started, interval_ns=%llu, isolated_cpus=%u\n",
+		PVSCHED_DEFAULT_INTERVAL_NS, pvsched_rt.isolated_cpus);
 	return 0;
 }
 
@@ -627,9 +650,19 @@ static long pvsched_ioctl(struct file *file, unsigned int cmd,
 
 		shm = entry->kvirt_ptr;
 		memset(shm, 0, PAGE_SIZE);
-		// FIXME: atomic opeation
-		shm->tgid     = entry->tgid;
-		shm->vcpu_num = uargs.vcpu_num;
+		/*
+		 * tgid 和 vcpu_num 无需完整原子操作，理由如下：
+		 * 1. 这两个字段在整个生命周期内仅被写入一次（此处）；
+		 * 2. host worker 通过 entry->vcpu_num 获取 vCPU 数量，
+		 *    不直接读取 shm->vcpu_num，故不存在与 worker 的竞争；
+		 * 3. guest 在 QEMU 的 ioctl 系统调用返回后才能感知共享内存，
+		 *    系统调用返回自带完整内存序（full barrier），保证 guest
+		 *    看到的数据已经完整写入；
+		 * 使用 WRITE_ONCE() 防止编译器将 32 位写操作拆分为多次
+		 * 小写（byte/halfword），同时向读者明确这是有意的单次写入。
+		 */
+		WRITE_ONCE(shm->tgid, entry->tgid);
+		WRITE_ONCE(shm->vcpu_num, uargs.vcpu_num);
 		for (i = 0; i < uargs.vcpu_num; i++)
 			atomic64_set(&shm->info[i].tokens, 0);
 
